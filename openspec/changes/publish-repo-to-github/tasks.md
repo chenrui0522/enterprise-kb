@@ -7,20 +7,20 @@
 
 ## 2. git 初始化与安全预检
 
-- [ ] 2.1 检查 git 可用性与 `user.name`/`user.email`；缺失时按 design 决策用 GitHub 账号身份配置
-- [ ] 2.2 执行 `git init -b main` 初始化仓库
-- [ ] 2.3 执行 `git add -A -n` 预检，确认 `.env`、`data/`、`.venv/`、`node_modules/`、egg-info 均不在待暂存清单中
-- [ ] 2.4 正式 `git add -A` 并复核 `git status --short` 的暂存文件与文件总数符合预期
-- [ ] 2.5 创建首个 commit（信息如 `chore: initial commit for public release`）
+- [x] 2.1 检查 git 可用性与 `user.name`/`user.email`；缺失时按 design 决策用 GitHub 账号身份配置
+- [x] 2.2 执行 `git init -b main` 初始化仓库
+- [x] 2.3 执行 `git add -A -n` 预检，确认 `.env`、`data/`、`.venv/`、`node_modules/`、egg-info 均不在待暂存清单中
+- [x] 2.4 正式 `git add -A` 并复核 `git status --short` 的暂存文件与文件总数符合预期
+- [x] 2.5 创建首个 commit（信息如 `chore: initial commit for public release`）
 
 ## 3. 创建 GitHub 仓库并推送
 
-- [ ] 3.1 检查 `gh` CLI 是否安装并已认证（`gh auth status`）；未就绪时引导用户完成认证或选用回退方案
-- [ ] 3.2 执行 `gh repo create enterprise-kb --public --source=. --remote=origin --push` 创建并推送
-- [ ] 3.3 `gh` 不可用时回退：提示用户提供 GitHub 用户名 → `git remote add origin` → 配置推送凭据 → 推送 `main`
+- [x] 3.1 检查 `gh` CLI 是否安装并已认证（`gh auth status`）；未就绪时引导用户完成认证或选用回退方案
+- [x] 3.2 创建 GitHub 公开仓库并推送（`gh` 令牌失效，改由用户网页创建 `chenrui0522/enterprise-kb` + 3.3 回退推送等效完成）
+- [x] 3.3 `gh` 不可用时回退：提示用户提供 GitHub 用户名 → `git remote add origin` → 配置推送凭据 → 推送 `main`
 
 ## 4. 发布后核验
 
-- [ ] 4.1 核验 `git status` 干净、`git remote -v` 与 `git log` 正常
-- [ ] 4.2 通过 `gh repo view enterprise-kb`（或网页/API）确认仓库为 public 且首 commit 存在
-- [ ] 4.3 汇总仓库地址、推送结果与后续可选项（更换许可证、补充合成演示语料等）
+- [x] 4.1 核验 `git status` 干净、`git remote -v` 与 `git log` 正常
+- [x] 4.2 通过 `gh repo view enterprise-kb`（或网页/API）确认仓库为 public 且首 commit 存在
+- [x] 4.3 汇总仓库地址、推送结果与后续可选项（更换许可证、补充合成演示语料等）
