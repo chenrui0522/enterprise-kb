@@ -1,0 +1,1 @@
+"""Async ingestion worker."""
