@@ -12,6 +12,7 @@ from app.core.errors import NotFoundError
 from app.core.logging import get_logger
 from app.core.redis import get_redis
 from app.core.tenant import tenant_dependency
+from app.ingestion.doc_types import normalize_doc_type
 from app.ingestion.queue import enqueue_job, make_job
 from app.ingestion.storage import FileDocumentStorage
 from app.ingestion.converters import IMAGE_EXTENSIONS
@@ -43,10 +44,15 @@ ALLOWED_EXTENSIONS = {
 async def upload_document(
     file: UploadFile = File(...),
     ocr: bool = Query(False, description="强制走 MinerU OCR 解析扫描件/复杂彩页手册"),
+    doc_type: str | None = Query(None, description="文档类型：faq / policy / sop / table / generic，缺省自动判断"),
     session: AsyncSession = Depends(get_db_session),
     tenant_id: str = Depends(tenant_dependency),
 ) -> DocumentUploadOut:
     settings = get_settings()
+    try:
+        resolved_doc_type = normalize_doc_type(doc_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     filename = file.filename or "unnamed.pdf"
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -97,6 +103,7 @@ async def upload_document(
         stage="queued",
         storage_key="",
         parse_mode="ocr" if needs_ocr else "auto",
+        doc_type=resolved_doc_type,
     )
     session.add(version)
     await session.flush()
@@ -106,7 +113,17 @@ async def upload_document(
     version.storage_key = storage_key
     await session.commit()
 
-    await enqueue_job(get_redis(), make_job(document.id, version.id, tenant_id, storage_key))
+    await enqueue_job(
+        get_redis(),
+        make_job(
+            document.id,
+            version.id,
+            tenant_id,
+            storage_key,
+            doc_type=resolved_doc_type,
+            chunker_version=settings.chunker_version,
+        ),
+    )
     await write_audit(
         session,
         tenant_id,
@@ -167,6 +184,7 @@ async def retry_document(
     if version is None:
         raise HTTPException(status_code=409, detail="没有可重试的处理版本")
 
+    settings = get_settings()
     version.status = "pending"
     version.stage = "queued"
     version.error_message = None
@@ -178,7 +196,14 @@ async def retry_document(
 
     await enqueue_job(
         get_redis(),
-        make_job(document.id, version.id, tenant_id, version.storage_key),
+        make_job(
+            document.id,
+            version.id,
+            tenant_id,
+            version.storage_key,
+            doc_type=version.doc_type,
+            chunker_version=settings.chunker_version,
+        ),
     )
     await write_audit(
         session,

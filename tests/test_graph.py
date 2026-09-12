@@ -106,11 +106,11 @@ async def test_no_results_refuses_instead_of_guessing() -> None:
 
 @pytest.mark.asyncio
 async def test_parallel_rerank_semaphore_cap() -> None:
-    """Verifies 10-concurrency cap wiring (semaphore is created from settings)."""
+    """Verifies the rerank concurrency cap comes from settings, not a hardcoded value."""
     from app.core.config import Settings
 
-    settings = Settings()
-    assert settings.rerank_max_concurrency == 10
+    assert Settings.model_fields["rerank_max_concurrency"].default == 10
+    assert Settings(rerank_max_concurrency=32).rerank_max_concurrency == 32
 
 
 @pytest.mark.asyncio

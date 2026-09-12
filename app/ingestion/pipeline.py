@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.logging import get_logger
-from app.ingestion.chunker import ChunkContext, chunk_markdown
+from app.ingestion.chunker import ChunkContext, DEFAULT_CHUNKER_VERSION, chunk_structure
+from app.ingestion.structure import structure_from_markdown
 from app.ingestion.converters import (
     ConversionResult,
     FileConverter,
@@ -43,7 +44,17 @@ class IngestionPipeline:
         self._converter = converter
         self._settings = settings
 
-    async def process_job(self, session: AsyncSession, job: dict, chunk_size: int, overlap: int) -> None:
+    async def process_job(
+        self,
+        session: AsyncSession,
+        job: dict,
+        chunk_size: int,
+        overlap: int,
+        doc_type: str | None = None,
+        chunker_version: str | None = None,
+    ) -> None:
+        doc_type = doc_type or job.get("doc_type")
+        chunker_version = chunker_version or job.get("chunker_version")
         doc_id = job["doc_id"]
         version_id = job["version_id"]
         document = await session.get(Document, doc_id)
@@ -53,7 +64,7 @@ class IngestionPipeline:
             return
 
         try:
-            await self._run(session, document, version, job, chunk_size, overlap)
+            await self._run(session, document, version, job, chunk_size, overlap, doc_type, chunker_version)
         except Exception as exc:
             logger.exception("Document ingestion failed doc=%s version=%s", doc_id, version_id)
             document.status = "failed"
@@ -72,6 +83,8 @@ class IngestionPipeline:
         job: dict,
         chunk_size: int,
         overlap: int,
+        doc_type: str | None = None,
+        chunker_version: str | None = None,
     ) -> None:
         file_path = self._storage.resolve(job["storage_key"])
 
@@ -86,7 +99,18 @@ class IngestionPipeline:
             tenant_id=document.tenant_id,
             title=document.title,
         )
-        drafts = chunk_markdown(markdown, context, chunk_size=chunk_size, overlap=overlap)
+        resolved_doc_type = (doc_type or getattr(version, "doc_type", "") or "").strip().lower()
+        if resolved_doc_type in {"", "auto"}:
+            resolved_doc_type = None
+        structure = converted.structure or structure_from_markdown(markdown)
+        drafts = chunk_structure(
+            structure,
+            context,
+            doc_type=resolved_doc_type,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            chunker_version=chunker_version or DEFAULT_CHUNKER_VERSION,
+        )
         if not drafts:
             raise ValueError("切分后没有生成任何片段")
 
@@ -94,9 +118,14 @@ class IngestionPipeline:
         chunks = await self._embed_drafts(drafts, context)
 
         await self._set_stage(session, document, version, "indexing")
+        if job.get("reindex"):
+            self._store.delete_by_version(version.id)
         inserted = self._store.insert(chunks)
         old_version_id = document.current_version_id
 
+        if resolved_doc_type:
+            version.doc_type = resolved_doc_type
+        version.chunker_version = drafts[0].chunker_version if drafts else ""
         version.status = "ready"
         version.stage = "ready"
         version.chunk_count = inserted
@@ -180,9 +209,12 @@ class IngestionPipeline:
         return [("text", converter_for(filename))]
 
     async def _embed_drafts(self, drafts: list[ChunkDraft], context: ChunkContext) -> list[ChunkRecord]:
+        settings = self._settings or get_settings()
+        batch_size = max(settings.embed_batch_size, 1)
         chunks: list[ChunkRecord] = []
-        for start in range(0, len(drafts), 32):
-            batch = drafts[start : start + 32]
+        total = len(drafts)
+        for start in range(0, total, batch_size):
+            batch = drafts[start : start + batch_size]
             vectors = await self._embedder.embed([item.text for item in batch])
             for draft, vector in zip(batch, vectors, strict=False):
                 chunks.append(
@@ -197,7 +229,26 @@ class IngestionPipeline:
                         section=draft.section,
                         tenant_id=context.tenant_id,
                         vector=vector,
+                        chunk_type=draft.chunk_type,
+                        heading_path=draft.heading_path,
+                        clause_no=draft.clause_no,
+                        step_no=draft.step_no,
+                        faq_id=draft.faq_id,
+                        table_id=draft.table_id,
+                        row_start=draft.row_start,
+                        row_end=draft.row_end,
+                        parent_id=draft.parent_id,
+                        chunker_version=draft.chunker_version,
                     )
+                )
+            done = min(start + batch_size, total)
+            if (start // batch_size) % 5 == 0 or done >= total:
+                logger.info(
+                    "Embedded %d/%d chunks (version=%s, batch_size=%d)",
+                    done,
+                    total,
+                    context.version_id,
+                    batch_size,
                 )
         return chunks
 

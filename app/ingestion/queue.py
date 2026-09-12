@@ -11,16 +11,29 @@ from app.core.logging import get_logger
 logger = get_logger("ingestion.queue")
 
 
-def make_job(doc_id: str, version_id: str, tenant_id: str, storage_key: str) -> str:
-    return json.dumps(
-        {
-            "doc_id": doc_id,
-            "version_id": version_id,
-            "tenant_id": tenant_id,
-            "storage_key": storage_key,
-        },
-        ensure_ascii=False,
-    )
+def make_job(
+    doc_id: str,
+    version_id: str,
+    tenant_id: str,
+    storage_key: str,
+    *,
+    doc_type: str | None = None,
+    chunker_version: str | None = None,
+    reindex: bool = False,
+) -> str:
+    payload = {
+        "doc_id": doc_id,
+        "version_id": version_id,
+        "tenant_id": tenant_id,
+        "storage_key": storage_key,
+    }
+    if doc_type:
+        payload["doc_type"] = doc_type
+    if chunker_version:
+        payload["chunker_version"] = chunker_version
+    if reindex:
+        payload["reindex"] = True
+    return json.dumps(payload, ensure_ascii=False)
 
 
 async def enqueue_job(redis: Redis, job: str) -> None:

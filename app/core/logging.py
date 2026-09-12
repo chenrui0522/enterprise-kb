@@ -20,7 +20,20 @@ def setup_logging() -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
-    for noisy in ("uvicorn.access", "httpx", "httpcore", "pymilvus", "asyncio"):
+    for noisy in (
+        "uvicorn.access",
+        "httpx",
+        "httpcore",
+        "httpx2",
+        "httpcore2",
+        "openai",
+        "pdfminer",
+        "pymilvus",
+        "grpc",
+        "urllib3",
+        "transformers",
+        "asyncio",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

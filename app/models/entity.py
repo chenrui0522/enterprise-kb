@@ -53,6 +53,12 @@ class DocumentVersion(Base, TimestampMixin):
     parse_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="auto", server_default="auto"
     )  # auto | ocr
+    doc_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="auto", server_default="auto"
+    )  # auto | faq | policy | sop | table | generic
+    chunker_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
 
 
 class Conversation(Base, TimestampMixin):

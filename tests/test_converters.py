@@ -129,3 +129,112 @@ def test_chunk_markdown_respects_page_and_section(tmp_path) -> None:
     pages = {draft.page for draft in drafts}
     assert pages == {1, 2}
     assert any(draft.section == "保修政策" for draft in drafts)
+
+
+def _write_table_pdf(path: Path) -> None:
+    import fitz
+
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Warranty Manual", fontsize=20)
+    page.insert_text(
+        (72, 104),
+        "This section explains the warranty policy in detail for all supported products.",
+        fontsize=11,
+    )
+    left, top, col_w, row_h, cols, rows = 72, 140, 100, 20, 2, 3
+    for index in range(rows + 1):
+        y = top + index * row_h
+        page.draw_line(fitz.Point(left, y), fitz.Point(left + cols * col_w, y))
+    for index in range(cols + 1):
+        x = left + index * col_w
+        page.draw_line(fitz.Point(x, top), fitz.Point(x, top + rows * row_h))
+    cells = [["Indicator", "Weight"], ["Completion", "40%"], ["Quality", "60%"]]
+    for row in range(rows):
+        for column in range(cols):
+            page.insert_text(
+                fitz.Point(left + 6 + column * col_w, top + 14 + row * row_h),
+                cells[row][column],
+                fontsize=11,
+            )
+    document.save(path)
+    document.close()
+
+
+def test_pdf_converter_detects_heading_and_table_blocks(tmp_path) -> None:
+    target = tmp_path / "table.pdf"
+    _write_table_pdf(target)
+    result = PDFMarkdownConverter().convert(str(target))
+    assert result.page_count == 1
+    structure = result.structure
+    assert structure is not None
+    headings = [block for block in structure.blocks if block.type == "heading"]
+    assert headings and headings[0].text == "Warranty Manual"
+    tables = [block for block in structure.blocks if block.type == "table"]
+    assert tables
+    table = tables[0]
+    assert table.header == ["Indicator", "Weight"]
+    assert table.rows[0] == ["Completion", "40%"]
+    assert all(
+        "Indicator" not in block.text
+        for block in structure.blocks
+        if block.type == "paragraph"
+    )
+
+
+def test_docx_converter_structure_blocks_keep_order(tmp_path) -> None:
+    from docx import Document
+
+    target = tmp_path / "policy.docx"
+    doc = Document()
+    doc.add_heading("绩效考核办法", level=1)
+    doc.add_paragraph("本办法适用于全体员工。")
+    table = doc.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "指标"
+    table.cell(0, 1).text = "权重"
+    table.cell(1, 0).text = "完成率"
+    table.cell(1, 1).text = "40%"
+    doc.add_paragraph("后续说明。")
+    doc.save(target)
+
+    result = DocxMarkdownConverter().convert(str(target))
+    structure = result.structure
+    assert structure is not None
+    assert [block.type for block in structure.blocks] == ["heading", "paragraph", "table", "paragraph"]
+    assert structure.blocks[0].level == 1
+    table_block = structure.blocks[2]
+    assert table_block.header == ["指标", "权重"]
+    assert table_block.rows == [["完成率", "40%"]]
+
+
+def test_docx_converter_detects_localized_heading_style(tmp_path) -> None:
+    from docx import Document
+    from docx.enum.style import WD_STYLE_TYPE
+
+    target = tmp_path / "localized.docx"
+    doc = Document()
+    style = doc.styles.add_style("标题 1", WD_STYLE_TYPE.PARAGRAPH)
+    paragraph = doc.add_paragraph("本地化标题", style=style)
+    assert paragraph.text == "本地化标题"
+    doc.save(target)
+
+    result = DocxMarkdownConverter().convert(str(target))
+    structure = result.structure
+    assert structure is not None
+    assert structure.blocks[0].type == "heading"
+    assert structure.blocks[0].level == 1
+
+
+def test_text_converter_emits_list_and_table_blocks(tmp_path) -> None:
+    target = tmp_path / "policy.md"
+    target.write_text(
+        "## 备份策略\n\n- 每日备份\n- 每周校验\n\n| 项目 | 频率 |\n|---|---|\n| 全量 | 每日 |\n",
+        encoding="utf-8",
+    )
+    result = TextMarkdownConverter().convert(str(target))
+    structure = result.structure
+    assert structure is not None
+    assert any(block.type == "list" and block.items == ["每日备份", "每周校验"] for block in structure.blocks)
+    table = next(block for block in structure.blocks if block.type == "table")
+    assert table.header == ["项目", "频率"]
+    assert table.rows == [["全量", "每日"]]

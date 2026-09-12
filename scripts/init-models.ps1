@@ -1,71 +1,85 @@
 #!/usr/bin/env pwsh
-# Register bge-m3 + bge-reranker-v2-m3 in the Xinference container (CPU).
-# Model weights download from ModelScope (faster in CN than HuggingFace).
-# Auth is disabled in docker-compose.yml via XINFERENCE_AUTH_ADVANCED=false.
-
+# Launch bge-m3 + bge-reranker-v2-m3 in the Xinference container.
+#
+# GPU (default):
+#   powershell -ExecutionPolicy Bypass -File scripts\init-models.ps1
+# CPU fallback:
+#   powershell -ExecutionPolicy Bypass -File scripts\init-models.ps1 -Device cpu
+param(
+    [string]$Endpoint = "http://127.0.0.1:9997",
+    [ValidateSet("cuda", "cpu")][string]$Device = "cuda",
+    [int]$GpuIndex = 0,
+    [int]$TimeoutMinutes = 30
+)
 $ErrorActionPreference = "Stop"
-$Endpoint = "http://127.0.0.1:9997"
-$Service = "enterprise-kb-model-service-1"
 
-function Wait-Xinference {
-    for ($i = 0; $i -lt 30; $i++) {
-        try {
-            $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 "$Endpoint/v1/models"
-            return
-        } catch {
-            Start-Sleep -Seconds 5
-        }
+function Get-ModelSnapshot {
+    try {
+        $response = Invoke-RestMethod -Uri "$Endpoint/v1/models" -TimeoutSec 5
+        return [pscustomobject]@{ Ok = $true; Ids = @($response.data | ForEach-Object { $_.id }) }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Ids = @() }
     }
-    throw "Xinference did not become ready at $Endpoint"
+}
+
+function Wait-Endpoint {
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+        $snapshot = Get-ModelSnapshot
+        if ($snapshot.Ok) { return }
+        Start-Sleep -Seconds 5
+    }
+    throw "Xinference endpoint not reachable at $Endpoint"
+}
+
+function Wait-Model {
+    param([string]$Uid)
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    while ((Get-Date) -lt $deadline) {
+        $snapshot = Get-ModelSnapshot
+        if ($snapshot.Ok -and ($snapshot.Ids -contains $Uid)) {
+            Write-Host "$Uid is online."
+            return
+        }
+        Start-Sleep -Seconds 5
+    }
+    throw "Timed out waiting for model $Uid"
 }
 
 function Ensure-Model {
     param(
         [string]$Uid,
         [string]$ModelName,
-        [string]$ModelType,
-        [string]$VenvPath
+        [string]$ModelType
     )
-
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        Write-Host "Launching $ModelName (attempt $attempt/3)..."
-        $payload = (@{
-            model_uid = $Uid
-            model_name = $ModelName
-            model_type = $ModelType
-            model_format = "pytorch"
-            device = "cpu"
-            download_hub = "modelscope"
-        } | ConvertTo-Json -Compress)
-        $body = curl.exe -s -X POST "$Endpoint/v1/models" -H "Content-Type: application/json" -d $payload
-        if ($body -match '"model_uid"') {
-            Write-Host "$ModelName is ready."
-            return
-        }
-        if ($body -match "sentence-transformers|sentence_transformers") {
-            Write-Host "Installing sentence-transformers into the model virtual env..."
-            docker exec $Service sh -c `
-                "$VenvPath -m pip install -q -U sentence-transformers" `
-                | Out-Null
-        } else {
-            Write-Warning "Unexpected launch response: $body"
-        }
-        Start-Sleep -Seconds 3
+    $snapshot = Get-ModelSnapshot
+    if ($snapshot.Ok -and ($snapshot.Ids -contains $Uid)) {
+        Write-Host "$Uid already online, skipping launch."
+        return
     }
-    throw "Failed to launch $ModelName"
+    $payload = @{
+        model_uid    = $Uid
+        model_name   = $ModelName
+        model_type   = $ModelType
+        model_engine = "sentence_transformers"
+        model_format = "pytorch"
+        download_hub = "modelscope"
+        n_gpu        = if ($Device -eq "cuda") { 1 } else { 0 }
+    }
+    if ($Device -eq "cuda") { $payload["gpu_idx"] = @($GpuIndex) }
+    $body = $payload | ConvertTo-Json -Compress
+    Write-Host "Launching $ModelName on $Device ..."
+    Invoke-RestMethod -Uri "$Endpoint/v1/models?wait_ready=False" -Method Post `
+        -ContentType "application/json" -Body $body -TimeoutSec 30 | Out-Null
+    Wait-Model -Uid $Uid
 }
 
-Wait-Xinference
-Ensure-Model `
-    -Uid "bge-m3" `
-    -ModelName "bge-m3" `
-    -ModelType "embedding" `
-    -VenvPath "/root/.xinference/virtualenv/v4/bge-m3/default/3.12.13/bin/python"
+Wait-Endpoint
+Ensure-Model -Uid "bge-m3" -ModelName "bge-m3" -ModelType "embedding"
+Ensure-Model -Uid "bge-reranker-v2-m3" -ModelName "bge-reranker-v2-m3" -ModelType "rerank"
 
-Ensure-Model `
-    -Uid "bge-reranker-v2-m3" `
-    -ModelName "bge-reranker-v2-m3" `
-    -ModelType "rerank" `
-    -VenvPath "/root/.xinference/virtualenv/v4/bge-reranker-v2-m3/default/3.12.13/bin/python"
-
-Write-Host "All local models are ready."
+$models = (Invoke-RestMethod -Uri "$Endpoint/v1/models" -TimeoutSec 10).data
+foreach ($model in $models) {
+    $accelerators = ($model.accelerators -join ",")
+    Write-Host ("{0} ({1}) accelerators=[{2}]" -f $model.id, $model.model_type, $accelerators)
+}
+Write-Host "All local models are ready on $Device."

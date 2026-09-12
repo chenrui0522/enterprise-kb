@@ -1,0 +1,10 @@
+# Optional GPU override for the local model service.
+#
+# Usage (GPU machines):
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# The base docker-compose.yml stays CPU-safe; this file only requests GPU
+# devices for model-service (Xinference serves bge-m3 + bge-reranker-v2-m3).
+services:
+  model-service:
+    gpus: all

@@ -15,6 +15,19 @@ from app.retrieval.chunk import ChunkRecord
 
 logger = get_logger("retrieval.milvus")
 
+STRUCTURE_FIELDS = [
+    "chunk_type",
+    "heading_path",
+    "clause_no",
+    "step_no",
+    "faq_id",
+    "table_id",
+    "row_start",
+    "row_end",
+    "parent_id",
+    "chunker_version",
+]
+
 
 class MilvusStore:
     """Vector + BM25 hybrid store backed by Milvus 2.5."""
@@ -24,6 +37,7 @@ class MilvusStore:
         self._client = MilvusClient(uri=settings.milvus_uri)
         self._collection = settings.milvus_collection
         self._ready = False
+        self._structure_fields_supported: bool | None = None
 
     def ensure_collection(self) -> None:
         if self._ready:
@@ -49,6 +63,16 @@ class MilvusStore:
         schema.add_field(field_name="page", datatype=DataType.INT64)
         schema.add_field(field_name="section", datatype=DataType.VARCHAR, max_length=500)
         schema.add_field(field_name="tenant_id", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="chunk_type", datatype=DataType.VARCHAR, max_length=32)
+        schema.add_field(field_name="heading_path", datatype=DataType.VARCHAR, max_length=1000)
+        schema.add_field(field_name="clause_no", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="step_no", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="faq_id", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="table_id", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="row_start", datatype=DataType.INT64)
+        schema.add_field(field_name="row_end", datatype=DataType.INT64)
+        schema.add_field(field_name="parent_id", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="chunker_version", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="dense", datatype=DataType.FLOAT_VECTOR, dim=settings.milvus_vector_dim)
         schema.add_field(field_name="sparse", datatype=DataType.SPARSE_FLOAT_VECTOR)
         schema.add_function(
@@ -66,15 +90,20 @@ class MilvusStore:
             field_name="sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="BM25"
         )
         self._client.create_collection(
-            collection_name=self._collection, schema=schema, index_params=index_params
+            collection_name=self._collection,
+            schema=schema,
+            index_params=index_params,
+            consistency_level="Strong",
         )
         self._ready = True
         logger.info("Created Milvus collection %s", self._collection)
 
     def insert(self, chunks: list[ChunkRecord]) -> int:
         self.ensure_collection()
-        rows = [
-            {
+        supports_structure = self._supports_structure_fields()
+        rows = []
+        for chunk in chunks:
+            row = {
                 "id": chunk.id,
                 "text": chunk.text,
                 "title": chunk.title,
@@ -86,8 +115,22 @@ class MilvusStore:
                 "tenant_id": chunk.tenant_id,
                 "dense": chunk.vector,
             }
-            for chunk in chunks
-        ]
+            if supports_structure:
+                row.update(
+                    {
+                        "chunk_type": chunk.chunk_type,
+                        "heading_path": chunk.heading_path,
+                        "clause_no": chunk.clause_no,
+                        "step_no": chunk.step_no,
+                        "faq_id": chunk.faq_id,
+                        "table_id": chunk.table_id,
+                        "row_start": chunk.row_start,
+                        "row_end": chunk.row_end,
+                        "parent_id": chunk.parent_id,
+                        "chunker_version": chunk.chunker_version,
+                    }
+                )
+            rows.append(row)
         if not rows:
             return 0
         result = self._client.upsert(collection_name=self._collection, data=rows)
@@ -116,14 +159,38 @@ class MilvusStore:
             limit=top_n,
             expr=expr,
         )
+        output_fields = ["id", "text", "title", "doc_id", "version_id", "page", "section"]
+        if self._supports_structure_fields():
+            output_fields.extend(STRUCTURE_FIELDS)
         results = self._client.hybrid_search(
             collection_name=self._collection,
             reqs=[dense_req, bm25_req],
             ranker=RRFRanker(),
             limit=top_n,
-            output_fields=["id", "text", "title", "doc_id", "version_id", "page", "section"],
+            output_fields=output_fields,
         )
         return [_hit_to_dict(hit) for hit in (results[0] if results else [])]
+
+    def flush(self) -> None:
+        """Flush pending writes so a freshly ingested corpus is searchable immediately."""
+        if self._client.has_collection(self._collection):
+            self._client.flush(self._collection)
+    def drop_collection(self) -> None:
+        """Drop the configured collection; used by reindex tests and maintenance."""
+        if self._client.has_collection(self._collection):
+            self._client.drop_collection(self._collection)
+        self._ready = False
+        self._structure_fields_supported = None
+    def _supports_structure_fields(self) -> bool:
+        if self._structure_fields_supported is not None:
+            return self._structure_fields_supported
+        try:
+            description = self._client.describe_collection(self._collection)
+            names = {field.get("name") for field in description.get("fields", [])}
+            self._structure_fields_supported = all(field in names for field in STRUCTURE_FIELDS)
+        except Exception:
+            self._structure_fields_supported = False
+        return self._structure_fields_supported
 
 
 def _hit_to_dict(hit) -> dict:
@@ -137,4 +204,14 @@ def _hit_to_dict(hit) -> dict:
         "page": int(entity.get("page") or 0),
         "section": entity.get("section", ""),
         "score": float(hit.get("distance") or 0.0),
+        "chunk_type": entity.get("chunk_type", "") or "text",
+        "heading_path": entity.get("heading_path", "") or "",
+        "clause_no": entity.get("clause_no", "") or "",
+        "step_no": entity.get("step_no", "") or "",
+        "faq_id": entity.get("faq_id", "") or "",
+        "table_id": entity.get("table_id", "") or "",
+        "row_start": int(entity.get("row_start") or 0),
+        "row_end": int(entity.get("row_end") or 0),
+        "parent_id": entity.get("parent_id", "") or "",
+        "chunker_version": entity.get("chunker_version", "") or "",
     }

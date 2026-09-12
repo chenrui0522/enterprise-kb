@@ -139,3 +139,49 @@ async def test_failed_document_does_not_affect_ready_state(tmp_path) -> None:
         await session.refresh(bad)
         assert bad.status == "failed"
         assert bad.error_message
+
+
+@pytest.mark.asyncio
+async def test_reindex_job_is_idempotent_and_records_chunker_version(tmp_path) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    pdf = tmp_path / "policy.pdf"
+    _write_pdf(str(pdf), "Policy content about travel approval and reimbursement limits.")
+    storage = FileDocumentStorage(str(tmp_path / "docs"))
+    store = FakeStore()
+    pipeline = IngestionPipeline(store=store, embedder=FakeEmbedder(), storage=storage)
+
+    async with session_factory() as session:
+        document = Document(tenant_id="t1", title="差旅制度", filename="policy.pdf")
+        session.add(document)
+        await session.flush()
+        version = DocumentVersion(
+            tenant_id="t1",
+            doc_id=document.id,
+            storage_key=storage.store(document.id, "v1", "policy.pdf", pdf.read_bytes()),
+            doc_type="policy",
+        )
+        session.add(version)
+        await session.commit()
+
+        job = {
+            "doc_id": document.id,
+            "version_id": version.id,
+            "tenant_id": "t1",
+            "storage_key": version.storage_key,
+            "doc_type": "policy",
+            "reindex": True,
+        }
+        await pipeline.process_job(session, job, chunk_size=200, overlap=20)
+        first_count = len(store.inserted[0])
+        await pipeline.process_job(session, job, chunk_size=200, overlap=20)
+        second_count = len(store.inserted[1])
+
+        assert first_count == second_count > 0
+        assert store.deleted == [version.id, version.id]
+        await session.refresh(version)
+        assert version.doc_type == "policy"
+        assert version.chunker_version == "structure-v1:policy"

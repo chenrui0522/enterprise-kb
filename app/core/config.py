@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     # Ingestion chunking
     chunk_size: int = 800
     chunk_overlap: int = 80
+    chunker_version: str = "structure-v1"
+    embed_batch_size: int = 32
     history_turns: int = 5
 
     # Document storage & queue

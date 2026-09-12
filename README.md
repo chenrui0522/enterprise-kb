@@ -38,9 +38,11 @@ cp .env.example .env
 
 ```bash
 docker compose up -d postgres redis etcd minio milvus model-service
-# 等待健康检查通过后，注册本地模型（CPU，从 ModelScope 下载权重，可能需要几分钟）
-.\scripts\init-models.ps1    # Windows PowerShell：powershell -ExecutionPolicy Bypass -File scripts\init-models.ps1
-# bash 环境：./scripts/init-models.sh
+# 有 NVIDIA GPU 时改用 GPU override 启动模型服务（基础 compose 仍可用于纯 CPU）：
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d model-service
+# 等待健康检查通过后，注册本地模型（默认 GPU，从 ModelScope 下载权重，首次可能需要几分钟）
+.\scripts\init-models.ps1    # Windows；CPU 回退：-Device cpu
+# bash 环境：./scripts/init-models.sh        CPU 回退：MODEL_DEVICE=cpu ./scripts/init-models.sh
 ```
 
 ### 3. 启动后端与前端
@@ -70,7 +72,8 @@ alembic upgrade head
 | `KB_LLM_API_KEY` / `KB_LLM_MODEL` | DeepSeek key 与模型（默认 `deepseek-v4-flash`） |
 | `KB_EMBEDDER_BASE_URL` / `KB_EMBEDDER_MODEL` | Xinference embedding 地址与 bge-m3 |
 | `KB_RERANKER_BASE_URL` / `KB_RERANKER_MODEL` | Xinference rerank 地址与模型 |
-| `KB_RERANK_MAX_CONCURRENCY` | 重排并发上限（默认 10） |
+| `KB_RERANK_MAX_CONCURRENCY` | 重排并发上限（CPU 默认 10，GPU 可调到 32） |
+| `KB_EMBED_BATCH_SIZE` | 入库 embedding 批大小（CPU 默认 32，GPU 可用 128） |
 | `KB_RETRIEVAL_TOP_N` / `KB_RETRIEVAL_TOP_K` | 召回 / 精排数量（默认 20 / 3，初始值待语料调优） |
 | `KB_MILVUS_URI` / `KB_MILVUS_COLLECTION` | Milvus 地址与集合名 |
 | `KB_DATABASE_URL` / `KB_REDIS_URL` | PostgreSQL / Redis |
@@ -80,6 +83,25 @@ alembic upgrade head
 | `KB_MINERU_TIMEOUT_SECONDS` / `KB_MINERU_POLL_INTERVAL` | OCR 任务超时与轮询间隔（默认 3600s / 3s） |
 | `KB_MINERU_LANG` / `KB_MINERU_TABLE_ENABLE` / `KB_MINERU_FORMULA_ENABLE` | OCR 语言（默认 ch）、是否启用表格/公式解析 |
 
+## GPU 推理（可选）
+
+词嵌入（bge-m3）与重排（bge-reranker-v2-m3）默认可以在 CPU 上运行；有 NVIDIA GPU 且 Docker 支持 GPU 直通时，推荐切到 GPU：
+
+```bash
+# 1) 用 GPU override 启动模型服务（基础 compose 保持 CPU 可用）
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d model-service
+
+# 2) 启动/恢复两个模型（默认 cuda）
+powershell -ExecutionPolicy Bypass -File scripts\init-models.ps1
+# bash：./scripts/init-models.sh         CPU 回退：MODEL_DEVICE=cpu ./scripts/init-models.sh
+```
+
+验证：`curl http://127.0.0.1:9997/v1/models`，两个模型的 `accelerators` 应显示 GPU 编号（CPU 时为空数组）。
+
+- 显存参考：两个模型 fp32 同时驻留约 4.7GB（RTX 5060 8GB 实测可用）；
+- `KB_EMBED_BATCH_SIZE`：CPU 建议 32，GPU 可用 128；
+- `KB_RERANK_MAX_CONCURRENCY`：CPU 保持 10，GPU 可提高到 32；
+- 重启 `model-service` 会清空已启动模型列表（权重仍缓存在卷中），重新执行 `init-models` 脚本即可恢复，脚本是幂等的。
 ## MinerU OCR 接入（可选）
 
 MinerU 独立作为「统一解析服务」，本系统通过 HTTP 调用，不打包进 API/worker 镜像：
@@ -150,7 +172,7 @@ scripts/       init-models.sh 等
 
 ## 二次开发指引
 
-- **换模型**：只替换 `app/providers/factory.py` 对应工厂的实现；接口见 `app/providers/base.py`。GPU 升级只改 Xinference 设备参数与容器资源。
+- **换模型**：只替换 `app/providers/factory.py` 对应工厂的实现；接口见 `app/providers/base.py`。GPU 部署见上文「GPU 推理（可选）」。
 - **OCR 与解析器**：`app/ingestion/mineru.py` 是 MinerU HTTP 客户端，`app/ingestion/pipeline.py` 的 `_plan_converters` 决定路由（auto：文字 PDF→扫描回退 OCR；ocr：直接 OCR）。旧文档解析失败后调用重试即走新解析。
 - **换向量库 / 检索策略**：`app/retrieval/milvus_store.py` 是唯一直接触碰 Milvus 的地方。
 - **多租户 / 权限 / 审计 / 反馈**：所有表与集合均带 `tenant_id`；`app/chat/service.py` 的审计与反馈写入已预留，后续只需增加鉴权中间件与业务规则。
