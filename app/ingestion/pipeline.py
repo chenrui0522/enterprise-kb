@@ -89,6 +89,10 @@ class IngestionPipeline:
         chunker_version: str | None = None,
     ) -> None:
         file_path = self._storage.resolve(job["storage_key"])
+        if job.get("reindex"):
+            self._store.delete_by_version(version.id)
+            self._storage.delete_version_images(document.id, version.id)
+            await session.execute(delete(DocumentImage).where(DocumentImage.version_id == version.id))
 
         await self._set_stage(session, document, version, "parsing")
         converted = await self._convert_to_markdown(document, version, file_path)
@@ -164,10 +168,6 @@ class IngestionPipeline:
         chunks = await self._embed_drafts(drafts, context)
 
         await self._set_stage(session, document, version, "indexing")
-        if job.get("reindex"):
-            self._store.delete_by_version(version.id)
-            self._storage.delete_version_images(document.id, version.id)
-            await session.execute(delete(DocumentImage).where(DocumentImage.version_id == version.id))
         inserted = self._store.insert(chunks)
         old_version_id = document.current_version_id
 

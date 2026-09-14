@@ -253,6 +253,15 @@ async def test_pipeline_extracts_and_indexes_images(tmp_path) -> None:
         stored = list((tmp_path / "docs" / document.id / version.id / "images").glob("*"))
         assert stored
 
+        job["reindex"] = True
+        await pipeline.process_job(session, job, chunk_size=400, overlap=40)
+        images_after = (
+            await session.execute(select(DocumentImage).where(DocumentImage.version_id == version.id))
+        ).scalars().all()
+        assert len(images_after) == 1
+        stored_after = list((tmp_path / "docs" / document.id / version.id / "images").glob("*"))
+        assert stored_after
+
 @pytest.mark.asyncio
 async def test_pipeline_warns_when_image_extraction_fails(tmp_path, monkeypatch) -> None:
     import app.ingestion.pipeline as pipeline_module
