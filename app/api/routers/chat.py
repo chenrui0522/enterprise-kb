@@ -41,6 +41,65 @@ logger = get_logger("api.chat")
 router = APIRouter(tags=["chat"])
 
 
+MAX_IMAGES_PER_CITATION = 3
+
+
+def _image_payload(image) -> dict:
+    return {
+        "image_id": image.id,
+        "url": f"/api/v1/documents/{image.doc_id}/images/{image.id}",
+        "caption": image.caption or "",
+        "page": image.page,
+        "version_id": image.version_id,
+    }
+
+
+async def _attach_citation_images(
+    session: AsyncSession, tenant_id: str, citations: list[dict]
+) -> None:
+    """Attach image evidence to citations: explicit image chunks first, then same-page images."""
+    explicit = sorted({item.get("image_id") for item in citations if item.get("image_id")})
+    mapping: dict[str, list[dict]] = {}
+    if explicit:
+        result = await session.execute(
+            select(DocumentImage).where(
+                DocumentImage.tenant_id == tenant_id, DocumentImage.id.in_(explicit)
+            )
+        )
+        for image in result.scalars():
+            mapping.setdefault(image.id, []).append(_image_payload(image))
+    for item in citations:
+        item["images"] = mapping.get(item.get("image_id") or "", [])
+
+    pending = [
+        item
+        for item in citations
+        if not item["images"] and item.get("doc_id") and int(item.get("page") or 0) > 0
+    ]
+    if not pending:
+        return
+    doc_ids = sorted({item["doc_id"] for item in pending})
+    pages = sorted({int(item.get("page") or 0) for item in pending})
+    result = await session.execute(
+        select(DocumentImage)
+        .where(
+            DocumentImage.tenant_id == tenant_id,
+            DocumentImage.doc_id.in_(doc_ids),
+            DocumentImage.page.in_(pages),
+        )
+        .order_by(DocumentImage.page, DocumentImage.created_at)
+    )
+    by_key: dict[tuple[str, int], list[dict]] = {}
+    for image in result.scalars():
+        by_key.setdefault((image.doc_id, image.page), []).append(_image_payload(image))
+    for item in pending:
+        images = by_key.get((item["doc_id"], int(item.get("page") or 0)), [])
+        version_id = item.get("version_id")
+        if version_id:
+            images = [entry for entry in images if entry["version_id"] == version_id]
+        item["images"] = images[:MAX_IMAGES_PER_CITATION]
+
+
 async def _load_citation_images(
     session: AsyncSession, tenant_id: str, image_ids: list[str | None]
 ) -> dict[str, list[dict]]:
@@ -228,11 +287,7 @@ async def _chat_event_stream(graph: ChatGraph, payload: ChatRequest, tenant_id: 
                 detail={"user_message_id": user_message.id, "assistant_message_id": assistant_message.id},
             )
         async with session_factory() as session:
-            image_map = await _load_citation_images(
-                session, tenant_id, [item.get("image_id") for item in citations]
-            )
-        for item in citations:
-            item["images"] = image_map.get(item.get("image_id") or "", [])
+            await _attach_citation_images(session, tenant_id, citations)
 
         yield sse_event(
             {
