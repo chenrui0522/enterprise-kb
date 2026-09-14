@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import fitz
@@ -36,6 +36,7 @@ class ConversionResult:
     markdown: str
     page_count: int | None = None
     structure: DocumentStructure | None = None
+    images: list = field(default_factory=list)
 
 
 class FileConverter(ABC):

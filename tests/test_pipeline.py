@@ -185,3 +185,111 @@ async def test_reindex_job_is_idempotent_and_records_chunker_version(tmp_path) -
         await session.refresh(version)
         assert version.doc_type == "policy"
         assert version.chunker_version == "structure-v1:policy"
+
+@pytest.mark.asyncio
+async def test_pipeline_extracts_and_indexes_images(tmp_path) -> None:
+    import io
+
+    import fitz as fitz_module
+
+    from PIL import Image
+    from sqlalchemy import select
+
+    from app.models.entity import DocumentImage
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    buffer = io.BytesIO()
+    Image.frombytes("RGB", (200, 200), __import__("os").urandom(200 * 200 * 3)).save(buffer, format="PNG")
+    figure = tmp_path / "figure.png"
+    figure.write_bytes(buffer.getvalue())
+
+    pdf = tmp_path / "with_image.pdf"
+    document_pdf = fitz_module.open()
+    page = document_pdf.new_page()
+    page.insert_text((72, 72), "架构说明", fontsize=12)
+    page.insert_image(fitz_module.Rect(72, 100, 372, 400), filename=str(figure))
+    document_pdf.save(str(pdf))
+    document_pdf.close()
+
+    storage = FileDocumentStorage(str(tmp_path / "docs"))
+    store = FakeStore()
+    pipeline = IngestionPipeline(store=store, embedder=FakeEmbedder(), storage=storage)
+
+    async with session_factory() as session:
+        document = Document(tenant_id="t1", title="含图手册", filename="with_image.pdf")
+        session.add(document)
+        await session.flush()
+        version = DocumentVersion(
+            tenant_id="t1",
+            doc_id=document.id,
+            storage_key=storage.store(document.id, "v1", "with_image.pdf", pdf.read_bytes()),
+            doc_type="generic",
+        )
+        session.add(version)
+        await session.commit()
+
+        job = {
+            "doc_id": document.id,
+            "version_id": version.id,
+            "tenant_id": "t1",
+            "storage_key": version.storage_key,
+            "doc_type": "generic",
+        }
+        await pipeline.process_job(session, job, chunk_size=400, overlap=40)
+        await session.refresh(version)
+        assert version.status == "ready"
+
+        images = (
+            await session.execute(select(DocumentImage).where(DocumentImage.version_id == version.id))
+        ).scalars().all()
+        assert len(images) == 1
+        chunks = store.inserted[0]
+        assert any(chunk.chunk_type == "image" and chunk.image_id == images[0].id for chunk in chunks)
+
+        stored = list((tmp_path / "docs" / document.id / version.id / "images").glob("*"))
+        assert stored
+
+@pytest.mark.asyncio
+async def test_pipeline_warns_when_image_extraction_fails(tmp_path, monkeypatch) -> None:
+    import app.ingestion.pipeline as pipeline_module
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    pdf = tmp_path / "plain.pdf"
+    _write_pdf(str(pdf), "Plain text without images at all.")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("extractor unavailable")
+
+    monkeypatch.setattr(pipeline_module, "extract_images_local", _boom)
+
+    storage = FileDocumentStorage(str(tmp_path / "docs"))
+    pipeline = IngestionPipeline(store=FakeStore(), embedder=FakeEmbedder(), storage=storage)
+    async with session_factory() as session:
+        document = Document(tenant_id="t1", title="纯文本", filename="plain.pdf")
+        session.add(document)
+        await session.flush()
+        version = DocumentVersion(
+            tenant_id="t1",
+            doc_id=document.id,
+            storage_key=storage.store(document.id, "v1", "plain.pdf", pdf.read_bytes()),
+            doc_type="generic",
+        )
+        session.add(version)
+        await session.commit()
+        await pipeline.process_job(
+            session,
+            {"doc_id": document.id, "version_id": version.id, "tenant_id": "t1", "storage_key": version.storage_key},
+            chunk_size=300,
+            overlap=30,
+        )
+        await session.refresh(version)
+        assert version.status == "ready"
+        assert (version.error_message or "").startswith("warning:")

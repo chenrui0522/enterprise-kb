@@ -12,6 +12,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AppError, UpstreamError
 from app.core.logging import get_logger
 from app.ingestion.converters import ConversionResult, FileConverter
+from app.ingestion.images import parse_mineru_zip
 
 logger = get_logger("ingestion.mineru")
 
@@ -53,12 +54,12 @@ class MinerUConverter(FileConverter):
             await self._check_health(client, base_url)
             task_id = await self._submit(client, file_path)
             payload = await self._wait_terminal(client, base_url, task_id)
-            markdown = await self._fetch_markdown(client, base_url, task_id, payload)
+            markdown, images = await self._fetch_result(client, base_url, task_id, payload)
 
         if not markdown.strip():
             raise UpstreamError("MinerU 解析完成但未返回任何 Markdown 内容")
         logger.info("MinerU OCR finished for %s (task=%s)", file_path, task_id)
-        return ConversionResult(markdown=markdown, page_count=None)
+        return ConversionResult(markdown=markdown, page_count=None, images=images)
 
     # ------------------------------------------------------------------
     # mineru-api client
@@ -84,7 +85,9 @@ class MinerUConverter(FileConverter):
         settings = self._settings
         form = {
             "return_md": "true",
-            "response_format_zip": "false",
+            "return_images": "true",
+            "return_content_list": "true",
+            "response_format_zip": "true",
             "backend": settings.mineru_backend,
             "lang_list": settings.mineru_lang,
             "table_enable": str(settings.mineru_table_enable).lower(),
@@ -140,6 +143,31 @@ class MinerUConverter(FileConverter):
             f"MinerU 解析超时（>{settings.mineru_timeout_seconds}s），task_id={task_id}",
             status_code=504,
         )
+
+    async def _fetch_result(
+        self, client: httpx.AsyncClient, base_url: str, task_id: str, status_payload: dict[str, Any]
+    ) -> tuple[str, list]:
+        """Return (markdown, image_assets) from MinerU, preferring the ZIP response."""
+        try:
+            response = await client.get(f"/tasks/{task_id}/result")
+        except httpx.HTTPError as exc:
+            raise UpstreamError(f"获取 MinerU 解析结果失败：{exc}") from exc
+        if response.status_code >= 400:
+            raise UpstreamError(
+                f"MinerU 结果获取异常（HTTP {response.status_code}）：{response.text[:300]}"
+            )
+        content_type = response.headers.get("content-type", "")
+        body = response.content
+        if "zip" in content_type or body[:2] == b"PK":
+            try:
+                markdown, assets, _ = parse_mineru_zip(body)
+            except Exception:
+                logger.warning("Failed to parse MinerU ZIP output", exc_info=True)
+                markdown, assets = "", []
+            if markdown or assets:
+                return markdown, assets
+        markdown = await self._fetch_markdown(client, base_url, task_id, status_payload)
+        return markdown, []
 
     async def _fetch_markdown(
         self, client: httpx.AsyncClient, base_url: str, task_id: str, status_payload: dict[str, Any]

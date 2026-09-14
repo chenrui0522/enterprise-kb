@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from app.ingestion.models import ChunkDraft, ParsedPage
 from app.ingestion.structure import (
     BLOCK_HEADING,
+    BLOCK_IMAGE,
     BLOCK_LIST,
     BLOCK_PARAGRAPH,
     BLOCK_TABLE,
@@ -342,6 +343,8 @@ def chunk_structure(
         drafts = _chunk_table(structure, context, chunk_size)
     else:
         drafts = _chunk_generic(structure, context, chunk_size, overlap)
+
+    drafts.extend(_chunk_images(structure, context))
 
     if not drafts:
         drafts = _chunk_generic(structure, context, chunk_size, overlap)
@@ -684,6 +687,8 @@ def _table_drafts(
 
 
 def _block_lines(block: Block) -> list[str]:
+    if block.type == BLOCK_IMAGE:
+        return []
     if block.type == BLOCK_LIST and block.items:
         return [item.strip() for item in block.items if item.strip()]
     return [line.strip() for line in (block.text or "").splitlines() if line.strip()]
@@ -720,3 +725,38 @@ def _split_sentences(text: str, limit: int) -> list[str]:
     if current:
         parts.append(current)
     return parts or [text[:limit]]
+
+def _chunk_images(structure: DocumentStructure, context: ChunkContext) -> list[ChunkDraft]:
+    """Emit one chunk per image evidence so image citations can be displayed."""
+    drafts: list[ChunkDraft] = []
+    stack: list[tuple[int, str]] = []
+    section = context.title
+    for block in structure.blocks:
+        if block.type == BLOCK_HEADING:
+            _push_heading(stack, block)
+            section = block.text
+            continue
+        if block.type != BLOCK_IMAGE:
+            continue
+        text = block.text.strip()
+        if not text and not block.image_id:
+            continue
+        if not text:
+            text = f"图片（第{block.page}页）" if block.page else "图片"
+        drafts.append(
+            ChunkDraft(
+                text=text[:chunk_image_text_limit()],
+                page=block.page,
+                section=section,
+                chunk_index=0,
+                chunk_type="image",
+                heading_path=_path(stack) or section,
+                image_id=block.image_id,
+                chunker_version="",
+            )
+        )
+    return drafts
+
+
+def chunk_image_text_limit() -> int:
+    return 1000

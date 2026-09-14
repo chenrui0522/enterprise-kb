@@ -26,8 +26,7 @@ class ChunkRecord(BaseModel):
     row_end: int = 0
     parent_id: str = ""
     chunker_version: str = ""
-    parent_id: str = ""
-    chunker_version: str = ""
+    image_id: str = ""
 
 
 class SearchHit(BaseModel):
@@ -49,3 +48,4 @@ class SearchHit(BaseModel):
     row_end: int = 0
     parent_id: str = ""
     chunker_version: str = ""
+    image_id: str = ""

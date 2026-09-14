@@ -18,11 +18,13 @@ BLOCK_PARAGRAPH = "paragraph"
 BLOCK_LIST = "list"
 BLOCK_TABLE = "table"
 BLOCK_CODE = "code"
+BLOCK_IMAGE = "image"
 
 TABLE_SEPARATOR = re.compile(r"^\|[\s:\-|]+\|$")
 PAGE_MARKER = re.compile(r"<!--\s*PAGE:\s*(\d+)\s*-->")
 HEADING_LINE = re.compile(r"^(#{1,6})\s+(.+)$")
 LIST_LINE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+)$")
+IMAGE_LINE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
 
 
 class Block(BaseModel):
@@ -35,6 +37,7 @@ class Block(BaseModel):
     rows: list[list[str]] = Field(default_factory=list)
     header: list[str] = Field(default_factory=list)
     items: list[str] = Field(default_factory=list)
+    image_id: str = ""
     # Source position for formats that expose layout (PDF); 0 when unknown.
     y0: float = 0.0
     x0: float = 0.0
@@ -127,6 +130,20 @@ def structure_from_markdown(markdown: str, *, page_count: int | None = None) -> 
                 )
             continue
 
+        image_match = IMAGE_LINE.search(stripped)
+        if image_match and stripped.startswith("!"):
+            flush_paragraph()
+            blocks.append(
+                Block(
+                    type=BLOCK_IMAGE,
+                    text=image_match.group("alt").strip(),
+                    image_id=image_match.group("src").strip(),
+                    page=page,
+                )
+            )
+            index += 1
+            continue
+
         list_item = LIST_LINE.match(lines[index])
         if list_item:
             flush_paragraph()
@@ -172,6 +189,8 @@ def structure_to_markdown(structure: DocumentStructure) -> str:
             parts.append(markdown_table(block.header, block.rows, fallback_text=block.text))
         elif block.type == BLOCK_CODE:
             parts.append(block.text)
+        elif block.type == BLOCK_IMAGE:
+            parts.append(f"![{block.text}]({block.image_id})" if block.image_id else block.text)
         elif block.type == BLOCK_LIST:
             parts.extend(f"- {item}" for item in block.items)
         else:

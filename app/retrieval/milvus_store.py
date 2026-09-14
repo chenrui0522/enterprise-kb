@@ -26,6 +26,7 @@ STRUCTURE_FIELDS = [
     "row_end",
     "parent_id",
     "chunker_version",
+    "image_id",
 ]
 
 
@@ -73,6 +74,7 @@ class MilvusStore:
         schema.add_field(field_name="row_end", datatype=DataType.INT64)
         schema.add_field(field_name="parent_id", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="chunker_version", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="image_id", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="dense", datatype=DataType.FLOAT_VECTOR, dim=settings.milvus_vector_dim)
         schema.add_field(field_name="sparse", datatype=DataType.SPARSE_FLOAT_VECTOR)
         schema.add_function(
@@ -128,6 +130,7 @@ class MilvusStore:
                         "row_end": chunk.row_end,
                         "parent_id": chunk.parent_id,
                         "chunker_version": chunk.chunker_version,
+                        "image_id": chunk.image_id,
                     }
                 )
             rows.append(row)
@@ -214,4 +217,5 @@ def _hit_to_dict(hit) -> dict:
         "row_end": int(entity.get("row_end") or 0),
         "parent_id": entity.get("parent_id", "") or "",
         "chunker_version": entity.get("chunker_version", "") or "",
+        "image_id": entity.get("image_id", "") or "",
     }

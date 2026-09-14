@@ -95,4 +95,5 @@ def _to_hit(candidate: dict) -> SearchHit:
         row_end=int(candidate.get("row_end") or 0),
         parent_id=candidate.get("parent_id", "") or "",
         chunker_version=candidate.get("chunker_version", "") or "",
+        image_id=candidate.get("image_id", "") or "",
     )

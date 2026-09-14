@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.ingestion.chunker import ChunkContext, DEFAULT_CHUNKER_VERSION, chunk_structure
-from app.ingestion.structure import structure_from_markdown
+from app.ingestion.images import dedupe_assets, extract_images_local, filter_decorative
+from app.ingestion.structure import BLOCK_IMAGE, Block, structure_from_markdown
 from app.ingestion.converters import (
     ConversionResult,
     FileConverter,
@@ -21,7 +23,7 @@ from app.ingestion.converters import (
 from app.ingestion.mineru import MinerUConverter
 from app.ingestion.models import ChunkDraft
 from app.ingestion.storage import FileDocumentStorage
-from app.models.entity import Document, DocumentVersion
+from app.models.entity import Document, DocumentImage, DocumentVersion
 from app.providers.base import Embedder
 from app.retrieval.chunk import ChunkRecord
 from app.retrieval.milvus_store import MilvusStore
@@ -92,6 +94,47 @@ class IngestionPipeline:
         converted = await self._convert_to_markdown(document, version, file_path)
         markdown = converted.markdown
 
+        image_blocks: list[Block] = []
+        image_warning: str | None = None
+        try:
+            assets = list(getattr(converted, "images", None) or [])
+            if not assets:
+                assets = extract_images_local(str(file_path), document.filename)
+            assets = dedupe_assets(filter_decorative(assets))
+            for asset in assets:
+                storage_key = self._storage.store_image(
+                    document.id, version.id, asset.sha256, asset.suffix, asset.data
+                )
+                record = DocumentImage(
+                    tenant_id=document.tenant_id,
+                    doc_id=document.id,
+                    version_id=version.id,
+                    page=asset.page,
+                    bbox=",".join(str(value) for value in asset.bbox) if asset.bbox else None,
+                    storage_key=storage_key,
+                    sha256=asset.sha256,
+                    mime=asset.mime,
+                    width=asset.width,
+                    height=asset.height,
+                    caption=asset.caption or None,
+                    source=asset.source,
+                )
+                session.add(record)
+                await session.flush()
+                image_blocks.append(
+                    Block(
+                        type=BLOCK_IMAGE,
+                        text=asset.caption or "",
+                        image_id=record.id,
+                        page=asset.page,
+                    )
+                )
+            if assets:
+                logger.info("Extracted %d image(s) for version=%s", len(assets), version.id)
+        except Exception as exc:
+            logger.warning("Image extraction failed for %s", document.filename, exc_info=True)
+            image_warning = f"warning: 图片抽取失败：{str(exc)[:200]}"
+
         await self._set_stage(session, document, version, "chunking")
         context = ChunkContext(
             doc_id=document.id,
@@ -103,6 +146,8 @@ class IngestionPipeline:
         if resolved_doc_type in {"", "auto"}:
             resolved_doc_type = None
         structure = converted.structure or structure_from_markdown(markdown)
+        if image_blocks:
+            structure.blocks.extend(image_blocks)
         drafts = chunk_structure(
             structure,
             context,
@@ -120,6 +165,8 @@ class IngestionPipeline:
         await self._set_stage(session, document, version, "indexing")
         if job.get("reindex"):
             self._store.delete_by_version(version.id)
+            self._storage.delete_version_images(document.id, version.id)
+            await session.execute(delete(DocumentImage).where(DocumentImage.version_id == version.id))
         inserted = self._store.insert(chunks)
         old_version_id = document.current_version_id
 
@@ -129,12 +176,12 @@ class IngestionPipeline:
         version.status = "ready"
         version.stage = "ready"
         version.chunk_count = inserted
-        version.error_message = None
+        version.error_message = image_warning
         document.status = "ready"
         document.stage = "ready"
         document.page_count = converted.page_count
         document.current_version_id = version.id
-        document.error_message = None
+        document.error_message = image_warning
         await session.commit()
         logger.info(
             "Indexed doc=%s version=%s chunks=%s (replacing %s)",
@@ -146,6 +193,9 @@ class IngestionPipeline:
 
         if old_version_id and old_version_id != version.id:
             await asyncio.to_thread(self._store.delete_by_version, old_version_id)
+            self._storage.delete_version_images(document.id, old_version_id)
+            await session.execute(delete(DocumentImage).where(DocumentImage.version_id == old_version_id))
+            await session.commit()
 
     async def _convert_to_markdown(
         self, document: Document, version: DocumentVersion, file_path: Path
@@ -239,6 +289,7 @@ class IngestionPipeline:
                         row_end=draft.row_end,
                         parent_id=draft.parent_id,
                         chunker_version=draft.chunker_version,
+                        image_id=draft.image_id,
                     )
                 )
             done = min(start + batch_size, total)

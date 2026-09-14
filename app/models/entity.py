@@ -125,3 +125,26 @@ class FeedbackResponse(Base, TimestampMixin):
     )
     rating: Mapped[str] = mapped_column(String(16), nullable=False)  # up | down
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+class DocumentImage(Base, TimestampMixin):
+    __tablename__ = "document_images"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    doc_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    page: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    bbox: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    storage_key: Mapped[str] = mapped_column(String(1000), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    mime: Mapped[str] = mapped_column(String(64), nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    height: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Reserved for the VLM description step; empty until then.
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
