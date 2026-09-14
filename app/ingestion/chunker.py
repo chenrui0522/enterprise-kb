@@ -739,7 +739,8 @@ def _chunk_images(structure: DocumentStructure, context: ChunkContext) -> list[C
         if block.type != BLOCK_IMAGE:
             continue
         text = block.text.strip()
-        if not text and not block.image_id:
+        image_id = block.image_id if re.fullmatch(r"[0-9a-f]{32}", block.image_id or "") else ""
+        if not text and not image_id:
             continue
         if not text:
             text = f"图片（第{block.page}页）" if block.page else "图片"
@@ -751,7 +752,7 @@ def _chunk_images(structure: DocumentStructure, context: ChunkContext) -> list[C
                 chunk_index=0,
                 chunk_type="image",
                 heading_path=_path(stack) or section,
-                image_id=block.image_id,
+                image_id=image_id,
                 chunker_version="",
             )
         )

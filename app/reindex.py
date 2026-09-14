@@ -225,6 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     setup_logging()
     args = build_parser().parse_args()
     summary = await run(

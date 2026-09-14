@@ -146,6 +146,7 @@ class IngestionPipeline:
         if resolved_doc_type in {"", "auto"}:
             resolved_doc_type = None
         structure = converted.structure or structure_from_markdown(markdown)
+        structure.blocks = [block for block in structure.blocks if block.type != BLOCK_IMAGE]
         if image_blocks:
             structure.blocks.extend(image_blocks)
         drafts = chunk_structure(

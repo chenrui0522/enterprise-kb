@@ -94,7 +94,7 @@ def test_structure_and_chunker_emit_image_chunk() -> None:
     )
     image_drafts = [draft for draft in drafts if draft.chunk_type == "image"]
     assert len(image_drafts) == 1
-    assert image_drafts[0].image_id == "images/a.jpg"
+    assert image_drafts[0].image_id == ""
     assert image_drafts[0].text == "架构图"
 
 def test_storage_delete_version_images(tmp_path) -> None:
