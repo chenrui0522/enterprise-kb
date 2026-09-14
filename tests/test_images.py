@@ -115,3 +115,19 @@ def test_chunk_record_carries_image_id() -> None:
         tenant_id="t1", image_id="img-1",
     )
     assert record.image_id == "img-1"
+
+def test_parse_mineru_zip_tracks_heading_for_images() -> None:
+    import json
+
+    content_list = [
+        {"type": "text", "text": "第三章 考勤管理", "text_level": 2, "page_idx": 0},
+        {"type": "image", "img_path": "images/head.jpg", "image_caption": [], "page_idx": 0},
+    ]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("doc/auto/doc.md", "# 标题\n")
+        archive.writestr("doc/auto/images/head.jpg", _png((160, 160)))
+        archive.writestr("doc/auto/doc_content_list.json", json.dumps(content_list))
+
+    _, assets, _ = parse_mineru_zip(buffer.getvalue())
+    assert assets and assets[0].heading_path == "第三章 考勤管理"

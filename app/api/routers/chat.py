@@ -76,10 +76,13 @@ async def _attach_citation_images(
         for item in citations
         if not item["images"] and item.get("doc_id") and int(item.get("page") or 0) > 0
     ]
-    if not pending:
+    heading_pending = [item for item in citations if not item["images"] and item.get("heading_path")]
+    if not pending and not heading_pending:
         return
-    doc_ids = sorted({item["doc_id"] for item in pending})
-    pages = sorted({int(item.get("page") or 0) for item in pending})
+    if not pending:
+        pass
+    doc_ids = sorted({item["doc_id"] for item in pending}) or [""]
+    pages = sorted({int(item.get("page") or 0) for item in pending}) or [0]
     result = await session.execute(
         select(DocumentImage)
         .where(
@@ -94,6 +97,23 @@ async def _attach_citation_images(
         by_key.setdefault((image.doc_id, image.page), []).append(_image_payload(image))
     for item in pending:
         images = by_key.get((item["doc_id"], int(item.get("page") or 0)), [])
+        version_id = item.get("version_id")
+        if version_id:
+            images = [entry for entry in images if entry["version_id"] == version_id]
+        item["images"] = images[:MAX_IMAGES_PER_CITATION]
+
+    if not heading_pending:
+        return
+    result = await session.execute(
+        select(DocumentImage)
+        .where(DocumentImage.tenant_id == tenant_id, DocumentImage.heading_path != "")
+        .order_by(DocumentImage.created_at)
+    )
+    by_heading: dict[tuple[str, str], list[dict]] = {}
+    for image in result.scalars():
+        by_heading.setdefault((image.doc_id, image.heading_path), []).append(_image_payload(image))
+    for item in heading_pending:
+        images = by_heading.get((item["doc_id"], item["heading_path"]), [])
         version_id = item.get("version_id")
         if version_id:
             images = [entry for entry in images if entry["version_id"] == version_id]

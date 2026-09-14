@@ -186,6 +186,7 @@ class ChatGraph:
                     "section": hit.get("section") or None,
                     "image_id": hit.get("image_id") or None,
                     "version_id": hit.get("version_id") or None,
+                    "heading_path": hit.get("heading_path") or None,
                 }
             )
         system = GENERATE_SYSTEM_TEMPLATE.format(references="\n".join(references))

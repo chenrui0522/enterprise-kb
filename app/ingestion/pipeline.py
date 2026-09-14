@@ -10,7 +10,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.ingestion.chunker import ChunkContext, DEFAULT_CHUNKER_VERSION, chunk_structure
-from app.ingestion.images import dedupe_assets, extract_images_local, filter_decorative
+from app.ingestion.images import dedupe_assets, extract_images_local, filter_decorative, has_embedded_media
 from app.ingestion.structure import BLOCK_IMAGE, Block, structure_from_markdown
 from app.ingestion.converters import (
     ConversionResult,
@@ -122,6 +122,7 @@ class IngestionPipeline:
                     height=asset.height,
                     caption=asset.caption or None,
                     source=asset.source,
+                    heading_path=asset.heading_path,
                 )
                 session.add(record)
                 await session.flush()
@@ -207,6 +208,13 @@ class IngestionPipeline:
         else:
             parse_mode = (version.parse_mode or "auto").lower()
             candidates = self._plan_converters(document.filename, parse_mode, settings)
+            suffix = Path(document.filename).suffix.lower()
+            if (
+                settings.mineru_enabled
+                and suffix in {".docx", ".docm", ".pptx", ".xlsx", ".xlsm"}
+                and has_embedded_media(str(file_path))
+            ):
+                candidates = [("ocr", MinerUConverter(settings)), *candidates]
 
         last_error: BaseException | None = None
         for index, (label, converter) in enumerate(candidates):

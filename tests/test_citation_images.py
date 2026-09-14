@@ -50,3 +50,43 @@ async def test_same_page_images_are_limited_to_current_version() -> None:
     ]
     await _attach_citation_images(_MixedSession(), "t1", citations)
     assert [entry["image_id"] for entry in citations[0]["images"]] == ["imgB"]
+
+
+import types
+
+import pytest
+
+from app.api.routers.chat import _attach_citation_images
+
+
+class _HeadingSession:
+    async def execute(self, statement):  # noqa: ARG002
+        class _Result:
+            def scalars(self):
+                return [
+                    types.SimpleNamespace(
+                        id="imgH",
+                        doc_id="d1",
+                        version_id="v1",
+                        caption="",
+                        page=0,
+                        heading_path="第三章 考勤管理",
+                    )
+                ]
+        return _Result()
+
+
+@pytest.mark.asyncio
+async def test_attach_images_by_heading_for_pageless_formats() -> None:
+    citations = [
+        {
+            "chunk_id": "c1",
+            "doc_id": "d1",
+            "version_id": "v1",
+            "page": 0,
+            "image_id": None,
+            "heading_path": "第三章 考勤管理",
+        }
+    ]
+    await _attach_citation_images(_HeadingSession(), "t1", citations)
+    assert [entry["image_id"] for entry in citations[0]["images"]] == ["imgH"]

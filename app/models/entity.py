@@ -149,3 +149,4 @@ class DocumentImage(Base, TimestampMixin):
     # Reserved for the VLM description step; empty until then.
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
+    heading_path: Mapped[str] = mapped_column(String(1000), nullable=False, default="", server_default="")

@@ -41,6 +41,7 @@ class ImageAsset:
     caption: str = ""
     source: str = "local"
     width: int = 0
+    heading_path: str = ""
     height: int = 0
 
     @property
@@ -75,6 +76,14 @@ class ImageAsset:
 def filter_decorative(assets: list[ImageAsset]) -> list[ImageAsset]:
     """Drop icons, bullets and page decorations before storage."""
     return [asset for asset in assets if not asset.is_decorative()]
+
+
+def has_embedded_media(file_path: str) -> bool:
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            return any(name.startswith(IMAGE_MEDIA_PREFIXES) for name in archive.namelist())
+    except Exception:
+        return False
 
 
 def dedupe_assets(assets: list[ImageAsset]) -> list[ImageAsset]:
@@ -173,8 +182,15 @@ def parse_mineru_zip(content: bytes) -> tuple[str, list[ImageAsset], list[dict]]
             except Exception:
                 logger.warning("Could not parse MinerU content_list.json", exc_info=True)
         metadata: dict[str, dict] = {}
+        heading_by_image: dict[str, str] = {}
+        current_heading = ""
         for item in content_items:
+            if item.get("text_level"):
+                current_heading = str(item.get("text") or "").strip()
+                continue
             image_path = item.get("img_path")
+            if image_path:
+                heading_by_image[Path(str(image_path)).name] = current_heading
             if not image_path:
                 continue
             caption = " ".join(str(part) for part in item.get("image_caption") or [])
@@ -200,6 +216,7 @@ def parse_mineru_zip(content: bytes) -> tuple[str, list[ImageAsset], list[dict]]
                     page=int(info.get("page") or 0),
                     caption=str(info.get("caption") or ""),
                     bbox=tuple(bbox_values) if bbox_values else None,
+                    heading_path=heading_by_image.get(Path(name).name, ""),
                     source="mineru",
                 )
             )
