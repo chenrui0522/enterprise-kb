@@ -215,6 +215,33 @@ async def retry_document(
     )
     return {"id": document.id, "status": document.status, "stage": document.stage}
 
+@router.get("/documents/{document_id}/images")
+async def document_images(
+    document_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_dependency),
+) -> list[dict]:
+    """List stored images for one document so the UI can browse them."""
+    document = await session.get(Document, document_id)
+    if document is None or document.tenant_id != tenant_id:
+        raise NotFoundError("文档不存在")
+    result = await session.execute(
+        select(DocumentImage)
+        .where(DocumentImage.doc_id == document_id, DocumentImage.tenant_id == tenant_id)
+        .order_by(DocumentImage.page, DocumentImage.created_at)
+        .limit(500)
+    )
+    return [
+        {
+            "image_id": image.id,
+            "url": f"/api/v1/documents/{document_id}/images/{image.id}",
+            "caption": image.caption or "",
+            "page": image.page,
+        }
+        for image in result.scalars()
+    ]
+
+
 @router.get("/documents/{document_id}/images/{image_id}")
 async def document_image(
     document_id: str,

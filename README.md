@@ -142,6 +142,14 @@ export MINERU_MODEL_SOURCE=modelscope   # 国内下载模型权重
 
 然后把 `KB_MINERU_URL` 指向该服务即可。本系统只需 MinerU 提供 `/health`、`/tasks`、`/tasks/{id}`、`/tasks/{id}/result` 接口。
 
+## 图片证据（抽取与展示）
+
+含图文档入库时会抽取图片（MinerU 的 ZIP/content_list，或本地 PyMuPDF/Office 兜底）、按内容哈希去重并过滤装饰性小图；图片以 `document_images` 记录并与文档版本绑定。图片切片带 `image_id`，检索命中后引用中会返回 `images: [{image_id, url, caption}]`，前端在引用区展示缩略图、在文档页可浏览该文档的全部图片。
+
+- 图片读取接口：`GET /api/v1/documents/{id}/images`（列表）与 `GET /api/v1/documents/{id}/images/{image_id}`（原图），均按租户与文档归属校验
+- 版本替换或重导时旧版本图片会被清理；当前集合为 `kb_chunks_v3`（含 `image_id` 字段）
+- 图片的语义理解（VLM 描述）为后续第二步，本期只做抽取、展示与图内文字检索
+
 ## 主要 API
 
 - `POST /api/v1/documents`：上传 PDF / Word / PPT / Excel / Markdown / TXT / HTML / CSV / JSON / 图片(PNG/JPG)（立即受理，后台先转 Markdown 再入库）；可带 `?ocr=true` 强制走 MinerU OCR

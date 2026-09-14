@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { listDocuments, retryDocument, uploadDocument } from "../api.js";
+import { listDocumentImages, listDocuments, retryDocument, uploadDocument } from "../api.js";
 
 const STATUS_LABEL = {
   pending: "排队中",
@@ -42,6 +42,7 @@ export default function DocumentsPage() {
   const [message, setMessage] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [ocr, setOcr] = useState(false);
+  const [docImages, setDocImages] = useState({});
 
   const refresh = async () => {
     const rows = await listDocuments();
@@ -60,6 +61,19 @@ export default function DocumentsPage() {
       await uploadDocument(file, { ocr });
       setMessage("上传成功，正在后台处理");
       refresh();
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const toggleImages = async (id) => {
+    if (docImages[id]) {
+      setDocImages((prev) => ({ ...prev, [id]: null }));
+      return;
+    }
+    try {
+      const rows = await listDocumentImages(id);
+      setDocImages((prev) => ({ ...prev, [id]: rows }));
     } catch (error) {
       setMessage(error.message);
     }
@@ -145,12 +159,31 @@ export default function DocumentsPage() {
                   <i />
                   {STATUS_LABEL[document.status] || document.status}
                 </span>
+                {document.status === "ready" && (
+                  <button className="retry" onClick={() => toggleImages(document.id)}>
+                    图片
+                  </button>
+                )}
                 {document.status === "failed" && (
                   <button className="retry" onClick={() => onRetry(document.id)}>
                     重试
                   </button>
                 )}
               </div>
+              {docImages[document.id] && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 12px 12px", width: "100%" }}>
+                  {docImages[document.id].length === 0 && <span className="doc-meta">该文档没有图片</span>}
+                  {docImages[document.id].map((image) => (
+                    <a key={image.image_id} href={image.url} target="_blank" rel="noreferrer" title={image.caption || "查看原图"}>
+                      <img
+                        src={image.url}
+                        alt={image.caption || "文档图片"}
+                        style={{ width: 72, height: 72, objectFit: "cover", borderRadius: 6 }}
+                      />
+                    </a>
+                  ))}
+                </div>
+              )}
             </div>
           ))}
         </section>

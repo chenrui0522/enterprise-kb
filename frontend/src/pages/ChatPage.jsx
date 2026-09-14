@@ -242,6 +242,28 @@ export default function ChatPage() {
                                   : citation.section
                                     ? ` · ${citation.section}`
                                     : ""}
+                                {citation.images?.length > 0 && (
+                                  <span className="citation-images">
+                                    {citation.images.map((image) => (
+                                      <a
+                                        key={image.image_id}
+                                        href={image.url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        title={image.caption || "查看原图"}
+                                      >
+                                        <img
+                                          src={image.url}
+                                          alt={image.caption || "引用图片"}
+                                          style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 6, marginLeft: 6, verticalAlign: "middle" }}
+                                          onError={(event) => {
+                                            event.currentTarget.parentElement.style.display = "none";
+                                          }}
+                                        />
+                                      </a>
+                                    ))}
+                                  </span>
+                                )}
                               </span>
                             ))}
                           </div>

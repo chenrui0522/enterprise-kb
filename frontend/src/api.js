@@ -33,6 +33,9 @@ export async function getMessages(conversationId) {
 export async function listDocuments() {
   return jsonFetch("/documents");
 }
+export async function listDocumentImages(documentId) {
+  return jsonFetch(`/documents/${documentId}/images`);
+}
 
 export async function uploadDocument(file, { ocr = false } = {}) {
   const form = new FormData();
