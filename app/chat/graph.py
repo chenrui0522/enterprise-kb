@@ -184,6 +184,7 @@ class ChatGraph:
                     "document_title": hit["title"],
                     "page": hit["page"],
                     "section": hit.get("section") or None,
+                    "image_id": hit.get("image_id") or None,
                 }
             )
         system = GENERATE_SYSTEM_TEMPLATE.format(references="\n".join(references))

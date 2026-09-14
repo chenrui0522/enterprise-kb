@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.events import sse_event
@@ -25,9 +26,10 @@ from app.core.logging import get_logger
 from app.core.ratelimit import check_rate_limit
 from app.core.redis import get_redis
 from app.core.tenant import tenant_dependency
-from app.models.entity import Message
+from app.models.entity import DocumentImage, Message
 from app.schemas.chat import (
     ChatRequest,
+    CitationImageOut,
     CitationOut,
     ConversationCreate,
     ConversationOut,
@@ -37,6 +39,29 @@ from app.schemas.chat import (
 
 logger = get_logger("api.chat")
 router = APIRouter(tags=["chat"])
+
+
+async def _load_citation_images(
+    session: AsyncSession, tenant_id: str, image_ids: list[str | None]
+) -> dict[str, list[dict]]:
+    """Build image payloads for citations so the frontend can display originals."""
+    ids = sorted({value for value in image_ids if value})
+    if not ids:
+        return {}
+    result = await session.execute(
+        select(DocumentImage).where(DocumentImage.tenant_id == tenant_id, DocumentImage.id.in_(ids))
+    )
+    mapping: dict[str, list[dict]] = {}
+    for image in result.scalars():
+        mapping.setdefault(image.id, []).append(
+            {
+                "image_id": image.id,
+                "url": f"/api/v1/documents/{image.doc_id}/images/{image.id}",
+                "caption": image.caption or "",
+                "page": image.page,
+            }
+        )
+    return mapping
 
 
 @router.post("/conversations", response_model=ConversationOut, status_code=201)
@@ -67,6 +92,9 @@ async def messages_endpoint(
     tenant_id: str = Depends(tenant_dependency),
 ) -> list[MessageOut]:
     rows = await list_messages(session, tenant_id, conversation_id)
+    image_map = await _load_citation_images(
+        session, tenant_id, [item.image_id for _, citations in rows for item in citations]
+    )
     output: list[MessageOut] = []
     for message, citations in rows:
         output.append(
@@ -82,6 +110,9 @@ async def messages_endpoint(
                         document_title=item.document_title,
                         page=item.page,
                         section=item.section,
+                        images=[
+                            CitationImageOut(**entry) for entry in image_map.get(item.image_id or "", [])
+                        ],
                     )
                     for item in citations
                 ],
@@ -196,6 +227,13 @@ async def _chat_event_stream(graph: ChatGraph, payload: ChatRequest, tenant_id: 
                 resource_id=conversation_id,
                 detail={"user_message_id": user_message.id, "assistant_message_id": assistant_message.id},
             )
+        async with session_factory() as session:
+            image_map = await _load_citation_images(
+                session, tenant_id, [item.get("image_id") for item in citations]
+            )
+        for item in citations:
+            item["images"] = image_map.get(item.get("image_id") or "", [])
+
         yield sse_event(
             {
                 "event": "done",

@@ -75,3 +75,40 @@ def test_upload_rejects_unknown_doc_type(monkeypatch, tmp_path) -> None:
     )
     assert response.status_code == 422
     assert not session.added
+
+def test_document_image_endpoint_serves_file(monkeypatch, tmp_path) -> None:
+    import types
+
+    from app.models.entity import DocumentImage
+
+    storage_dir = tmp_path / "docs"
+    image_rel = "d1/v1/images/abc.png"
+    image_file = storage_dir / image_rel
+    image_file.parent.mkdir(parents=True, exist_ok=True)
+    image_file.write_bytes(b"\x89PNG\r\n\x1a\nfakepng")
+
+    fake_image = types.SimpleNamespace(
+        id="img1",
+        tenant_id="t1",
+        doc_id="d1",
+        storage_key=image_rel,
+        mime="image/png",
+        caption="",
+        page=1,
+    )
+
+    class ImageSession(FakeSession):
+        async def get(self, model, ident):
+            return fake_image if model is DocumentImage and ident == "img1" else None
+
+    session = ImageSession()
+    client = _client(monkeypatch, storage_dir, session)
+    response = client.get("/api/v1/documents/d1/images/img1")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/png")
+
+    from app.core.errors import NotFoundError
+
+    fake_image.tenant_id = "other"
+    with pytest.raises(NotFoundError):
+        client.get("/api/v1/documents/d1/images/img1")

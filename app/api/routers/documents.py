@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +17,7 @@ from app.ingestion.doc_types import normalize_doc_type
 from app.ingestion.queue import enqueue_job, make_job
 from app.ingestion.storage import FileDocumentStorage
 from app.ingestion.converters import IMAGE_EXTENSIONS
-from app.models.entity import Document, DocumentVersion
+from app.models.entity import Document, DocumentImage, DocumentVersion
 from app.schemas.documents import DocumentOut, DocumentUploadOut
 from app.chat.service import write_audit
 
@@ -213,3 +214,24 @@ async def retry_document(
         resource_id=document.id,
     )
     return {"id": document.id, "status": document.status, "stage": document.stage}
+
+@router.get("/documents/{document_id}/images/{image_id}")
+async def document_image(
+    document_id: str,
+    image_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_dependency),
+):
+    """Serve one stored document image, scoped to the caller's tenant."""
+    image = await session.get(DocumentImage, image_id)
+    if image is None or image.tenant_id != tenant_id or image.doc_id != document_id:
+        raise NotFoundError("图片不存在")
+    settings = get_settings()
+    path = FileDocumentStorage(settings.document_storage_dir).resolve(image.storage_key)
+    if not path.is_file():
+        raise NotFoundError("图片文件不存在")
+    return FileResponse(
+        path,
+        media_type=image.mime,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )

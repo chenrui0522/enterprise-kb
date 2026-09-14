@@ -97,6 +97,7 @@ class MessageCitation(Base, TimestampMixin):
     document_title: Mapped[str] = mapped_column(String(500), nullable=False)
     page: Mapped[int] = mapped_column(Integer, nullable=False)
     section: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    image_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     score: Mapped[float] = mapped_column(Float, nullable=True)
 
 

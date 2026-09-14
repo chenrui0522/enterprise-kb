@@ -24,12 +24,20 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
 
 
+class CitationImageOut(BaseModel):
+    image_id: str
+    url: str
+    caption: str = ""
+    page: int = 0
+
+
 class CitationOut(BaseModel):
     chunk_id: str
     doc_id: str
     document_title: str
     page: int
     section: str | None = None
+    images: list[CitationImageOut] = []
 
 
 class MessageOut(BaseModel):

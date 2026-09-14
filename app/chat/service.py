@@ -114,6 +114,7 @@ async def save_assistant_turn(
                 document_title=citation["document_title"],
                 page=int(citation["page"]),
                 section=citation.get("section"),
+                image_id=citation.get("image_id") or None,
                 score=citation.get("score"),
             )
         )
