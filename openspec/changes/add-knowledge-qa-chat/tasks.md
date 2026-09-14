@@ -83,4 +83,4 @@
 - [x] 11.5 前端文档页支持图片上传与“强制 OCR”开关、accept 与文案同步
 - [x] 11.6 docker-compose 增加可选 mineru profile 服务与 CPU 镜像 Dockerfile（docker/mineru/Dockerfile.cpu），GPU 升级路径写入 README
 - [x] 11.7 补充 MinerU 客户端与流水线 OCR 路由自动化测试并跑通（31 passed）
-- [ ] 11.8 端到端冒烟：本机启动 mineru-api（首次从 ModelScope 拉权重数 GB）后，用真实扫描 PDF/图片/复杂彩页走通 上传→ready→问答 并核对引用
+- [x] 11.8 端到端冒烟：本机启动 mineru-api（首次从 ModelScope 拉权重数 GB）后，用真实扫描 PDF/图片/复杂彩页走通 上传→ready→问答 并核对引用（已用扫描页图片经 HTTP 上传走通：pending/parsing→ready，SSE 问答命中并返回图片文档引用）

@@ -30,6 +30,10 @@ RUN pip install --index-url https://download.pytorch.org/whl/cpu \
 
 RUN pip install "mineru[pipeline]>=3.4,<4"
 
+# MinerU 3.4.5 pipeline path imports `six` but does not declare it; without this
+# the first OCR task fails with "No module named 'six'".
+RUN pip install --no-cache-dir "six>=1.16"
+
 EXPOSE 8000
 
 # The docker-compose "mineru-api" service overrides entrypoint/command and adds
