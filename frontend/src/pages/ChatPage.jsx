@@ -37,6 +37,24 @@ export default function ChatPage() {
   const [conversationId, setConversationId] = useState(null);
   const [conversationTitle, setConversationTitle] = useState("新对话");
   const [messages, setMessages] = useState([]);
+  const [lightbox, setLightbox] = useState(null);
+  const galleryFor = (message) => (message.citations || []).flatMap((item) => item.images || []);
+
+  useEffect(() => {
+    if (!lightbox) return undefined;
+    const onKey = (event) => {
+      if (event.key === "Escape") setLightbox(null);
+      if (event.key === "ArrowRight") {
+        setLightbox((prev) => (prev ? { ...prev, index: (prev.index + 1) % prev.images.length } : prev));
+      }
+      if (event.key === "ArrowLeft") {
+        setLightbox((prev) => (prev ? { ...prev, index: (prev.index - 1 + prev.images.length) % prev.images.length } : prev));
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [lightbox]);
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const textareaRef = useRef(null);
@@ -251,9 +269,18 @@ export default function ChatPage() {
                                         target="_blank"
                                         rel="noreferrer"
                                         title={image.caption || "查看原图"}
+                                        onClick={(event) => {
+                                          event.preventDefault();
+                                          const gallery = galleryFor(message);
+                                          setLightbox({
+                                            images: gallery,
+                                            index: gallery.findIndex((item) => item.image_id === image.image_id),
+                                          });
+                                        }}
                                       >
                                         <img
-                                          src={image.url}
+                                          src={`${image.url}?w=200`}
+                                          loading="lazy"
                                           alt={image.caption || "引用图片"}
                                           style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 6, marginLeft: 6, verticalAlign: "middle" }}
                                           onError={(event) => {
@@ -326,6 +353,37 @@ export default function ChatPage() {
           <div className="composer-hint">回答基于已上传文档生成，请核对引用来源</div>
         </footer>
       </main>
+      {lightbox && lightbox.images[lightbox.index] && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setLightbox(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.82)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 }}
+        >
+          <img
+            src={`${lightbox.images[lightbox.index].url}?w=800`}
+            alt={lightbox.images[lightbox.index].caption || "引用图片"}
+            onClick={(event) => event.stopPropagation()}
+            style={{ maxWidth: "90vw", maxHeight: "78vh", objectFit: "contain", borderRadius: 8, background: "#fff" }}
+          />
+          <div onClick={(event) => event.stopPropagation()} style={{ color: "#fff", marginTop: 12, fontSize: 13 }}>
+            {lightbox.images[lightbox.index].caption || "引用图片"}
+            {lightbox.images[lightbox.index].page > 0 ? ` · 第 ${lightbox.images[lightbox.index].page} 页` : ""}
+            {" · "}
+            <a href={lightbox.images[lightbox.index].url} target="_blank" rel="noreferrer" style={{ color: "#8ab4ff" }}>
+              查看原图
+            </a>
+          </div>
+          {lightbox.images.length > 1 && (
+            <div onClick={(event) => event.stopPropagation()} style={{ display: "flex", gap: 12, marginTop: 12 }}>
+              <button onClick={() => setLightbox((prev) => ({ ...prev, index: (prev.index - 1 + prev.images.length) % prev.images.length }))}>
+                上一张
+              </button>
+              <button onClick={() => setLightbox((prev) => ({ ...prev, index: (prev.index + 1) % prev.images.length }))}>下一张</button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

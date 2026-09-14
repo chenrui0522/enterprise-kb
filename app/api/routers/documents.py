@@ -242,21 +242,68 @@ async def document_images(
     ]
 
 
+THUMBNAIL_WIDTHS = (64, 200, 400, 800)
+
+
+def _thumbnail_width(requested: int | None) -> int | None:
+    if not requested or requested <= 0:
+        return None
+    allowed = [width for width in THUMBNAIL_WIDTHS if width <= requested]
+    return max(allowed) if allowed else THUMBNAIL_WIDTHS[0]
+
+
+def _thumbnail_path(root: Path, sha256: str, width: int) -> Path:
+    return root / "_thumbnails" / f"{sha256}_w{width}.jpg"
+
+
+def _ensure_thumbnail(source: Path, target: Path, width: int) -> bool:
+    if target.exists():
+        return True
+    try:
+        from PIL import Image
+
+        with Image.open(source) as picture:
+            picture = picture.convert("RGB")
+            if picture.width <= width:
+                return False
+            ratio = width / picture.width
+            resized = picture.resize((width, max(int(picture.height * ratio), 1)))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp = target.with_suffix(".tmp")
+            resized.save(temp, format="JPEG", quality=80)
+            temp.replace(target)
+        return True
+    except Exception:
+        logger.warning("Thumbnail generation failed for %s", source, exc_info=True)
+        return False
+
+
 @router.get("/documents/{document_id}/images/{image_id}")
 async def document_image(
     document_id: str,
     image_id: str,
+    w: int | None = Query(None, description="缩略图宽度档位（64/200/400/800），省略返回原图"),
     session: AsyncSession = Depends(get_db_session),
     tenant_id: str = Depends(tenant_dependency),
 ):
-    """Serve one stored document image, scoped to the caller's tenant."""
+    """Serve one stored document image (optionally a cached thumbnail)."""
     image = await session.get(DocumentImage, image_id)
     if image is None or image.tenant_id != tenant_id or image.doc_id != document_id:
         raise NotFoundError("图片不存在")
     settings = get_settings()
+    root = Path(settings.document_storage_dir)
     path = FileDocumentStorage(settings.document_storage_dir).resolve(image.storage_key)
     if not path.is_file():
         raise NotFoundError("图片文件不存在")
+    width = _thumbnail_width(w)
+    if width:
+        thumb = _thumbnail_path(root, image.sha256, width)
+        if _ensure_thumbnail(path, thumb, width):
+            return FileResponse(
+                thumb,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=86400"},
+            )
     return FileResponse(
         path,
         media_type=image.mime,
