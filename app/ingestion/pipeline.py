@@ -12,6 +12,7 @@ from app.core.logging import get_logger
 from app.ingestion.chunker import ChunkContext, DEFAULT_CHUNKER_VERSION, chunk_structure
 from app.ingestion.images import dedupe_assets, extract_images_local, filter_decorative, has_embedded_media
 from app.ingestion.structure import BLOCK_IMAGE, Block, structure_from_markdown
+from app.ingestion.conversion import convert_safely
 from app.ingestion.converters import (
     ConversionResult,
     FileConverter,
@@ -219,7 +220,7 @@ class IngestionPipeline:
         last_error: BaseException | None = None
         for index, (label, converter) in enumerate(candidates):
             try:
-                return await converter.convert_async(str(file_path))
+                return await convert_safely(converter, str(file_path), label=label)
             except NoExtractableContentError as exc:
                 last_error = exc
                 if index + 1 < len(candidates):
