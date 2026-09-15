@@ -1,6 +1,6 @@
 ## 1. 数据模型与迁移
 
-- [ ] 1.1 新增 `chunk_parents` 与 `document_tables` 表及迁移，验证 `uv run alembic upgrade head` 成功
+- [x] 1.1 新增 `chunk_parents` 与 `document_tables` 表及迁移，验证 `uv run alembic upgrade head` 成功
 - [ ] 1.2 统一 chunk schema 增加 `chunk_kind`/`row_index` 等字段，验证新集合可写入与检索
 - [x] 1.3 `document_versions` 记录切片器版本与父子/表格统计，验证文档状态可查询
 
