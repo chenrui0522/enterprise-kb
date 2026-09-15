@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from app.chat.graph import ChatGraph
 from app.chat.parent_context import build_parent_expander
 from app.core.config import get_settings
-from app.core.db import create_tables_if_needed, dispose_engine
+from app.core.db import create_tables_if_needed, dispose_engine, get_session_factory
 from app.core.errors import AppError
 from app.core.logging import get_logger, setup_logging
 from app.core.redis import close_redis, get_redis
