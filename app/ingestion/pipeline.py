@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from sqlalchemy import delete
@@ -9,27 +10,38 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.logging import get_logger
+from app.ingestion.cache import ParseCache
 from app.ingestion.chunker import ChunkContext, DEFAULT_CHUNKER_VERSION, chunk_structure
-from app.ingestion.images import dedupe_assets, extract_images_local, filter_decorative, has_embedded_media
+from app.ingestion.docling import docling_available
+from app.ingestion.images import dedupe_assets, extract_images_local, filter_decorative
 from app.ingestion.structure import BLOCK_IMAGE, Block, structure_from_markdown
 from app.ingestion.conversion import convert_safely
 from app.ingestion.converters import (
     ConversionResult,
     FileConverter,
-    IMAGE_EXTENSIONS,
     NoExtractableContentError,
-    PDFMarkdownConverter,
-    converter_for,
 )
-from app.ingestion.mineru import MinerUConverter
 from app.ingestion.models import ChunkDraft
 from app.ingestion.storage import FileDocumentStorage
+from app.ingestion.triage import TriageResult, plan_candidates, triage_file
 from app.models.entity import Document, DocumentImage, DocumentVersion
 from app.providers.base import Embedder
 from app.retrieval.chunk import ChunkRecord
 from app.retrieval.milvus_store import MilvusStore
 
 logger = get_logger("ingestion.pipeline")
+
+
+def _is_recoverable(exc: AppError) -> bool:
+    """Whether the next candidate converter should be tried.
+
+    Handing over makes sense when the *converter* could not do the job (service
+    down, nothing extractable, upstream failure). It does not make sense when
+    the file itself is unusable - a corrupt or encrypted file will be rejected
+    by every other converter too, and retrying it through a slow OCR service
+    only delays the error.
+    """
+    return isinstance(exc, NoExtractableContentError) or exc.status_code >= 500
 
 
 class IngestionPipeline:
@@ -46,6 +58,10 @@ class IngestionPipeline:
         self._storage = storage
         self._converter = converter
         self._settings = settings
+        self._last_conversion_meta: dict = {}
+        self._last_triage: dict = {}
+        self._last_plan: list[str] = []
+        self._last_failures: list[dict] = []
 
     async def process_job(
         self,
@@ -92,11 +108,15 @@ class IngestionPipeline:
         file_path = self._storage.resolve(job["storage_key"])
         if job.get("reindex"):
             self._store.delete_by_version(version.id)
-            self._storage.delete_version_images(document.id, version.id)
+            self._storage.delete_version_assets(document.id, version.id)
             await session.execute(delete(DocumentImage).where(DocumentImage.version_id == version.id))
 
         await self._set_stage(session, document, version, "parsing")
+        started = time.perf_counter()
         converted = await self._convert_to_markdown(document, version, file_path)
+        conversion_meta = dict(getattr(self, "_last_conversion_meta", {}) or {})
+        conversion_meta["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+        conversion_meta.update(self._conversion_evidence(converted))
         markdown = converted.markdown
 
         image_blocks: list[Block] = []
@@ -142,6 +162,16 @@ class IngestionPipeline:
             image_warning = f"warning: 图片抽取失败：{str(exc)[:200]}"
 
         await self._set_stage(session, document, version, "chunking")
+        conversion_meta.update(
+            {
+                "markdown_chars": len(markdown or ""),
+                "structure_blocks": len(
+                    (converted.structure.blocks if converted.structure else []) or []
+                ),
+                "degraded": bool(getattr(converted.structure, "degraded", False)),
+            }
+        )
+
         context = ChunkContext(
             doc_id=document.id,
             version_id=version.id,
@@ -151,7 +181,11 @@ class IngestionPipeline:
         resolved_doc_type = (doc_type or getattr(version, "doc_type", "") or "").strip().lower()
         if resolved_doc_type in {"", "auto"}:
             resolved_doc_type = None
-        structure = converted.structure or structure_from_markdown(markdown)
+        structure = (
+            converted.structure
+            if converted.structure and converted.structure.blocks
+            else structure_from_markdown(markdown, page_count=converted.page_count)
+        )
         structure.blocks = [block for block in structure.blocks if block.type != BLOCK_IMAGE]
         if image_blocks:
             structure.blocks.extend(image_blocks)
@@ -173,6 +207,9 @@ class IngestionPipeline:
         inserted = self._store.insert(chunks)
         old_version_id = document.current_version_id
 
+        conversion_meta["images"] = len(image_blocks)
+        conversion_meta["table_files"] = self._store_tables(document, version, converted)
+        version.conversion_report = conversion_meta
         if resolved_doc_type:
             version.doc_type = resolved_doc_type
         version.chunker_version = drafts[0].chunker_version if drafts else ""
@@ -196,7 +233,7 @@ class IngestionPipeline:
 
         if old_version_id and old_version_id != version.id:
             await asyncio.to_thread(self._store.delete_by_version, old_version_id)
-            self._storage.delete_version_images(document.id, old_version_id)
+            self._storage.delete_version_assets(document.id, old_version_id)
             await session.execute(delete(DocumentImage).where(DocumentImage.version_id == old_version_id))
             await session.commit()
 
@@ -204,70 +241,159 @@ class IngestionPipeline:
         self, document: Document, version: DocumentVersion, file_path: Path
     ) -> ConversionResult:
         settings = self._settings or get_settings()
+        self._last_triage = {}
+        self._last_plan = []
+        self._last_failures = []
         if self._converter is not None:
-            candidates = [("injected", self._converter)]
+            candidates: list[tuple[str, FileConverter]] = [("injected", self._converter)]
         else:
             parse_mode = (version.parse_mode or "auto").lower()
-            candidates = self._plan_converters(document.filename, parse_mode, settings)
-            suffix = Path(document.filename).suffix.lower()
-            if (
-                settings.mineru_enabled
-                and suffix in {".docx", ".docm", ".pptx", ".xlsx", ".xlsm"}
-                and has_embedded_media(str(file_path))
-            ):
-                candidates = [("ocr", MinerUConverter(settings)), *candidates]
+            triage = self._triage(file_path, document.filename, parse_mode, settings)
+            docling_candidate = False
+            if settings.docling_enabled:
+                docling_candidate = await docling_available(settings)
+            candidates = self._plan_converters(
+                document.filename, parse_mode, settings, triage, docling_candidate
+            )
+        self._last_plan = [label for label, _ in candidates]
 
-        last_error: BaseException | None = None
-        for index, (label, converter) in enumerate(candidates):
+        cache = self._parse_cache(settings)
+        digest = ""
+        if cache.enabled:
             try:
-                return await convert_safely(converter, str(file_path), label=label)
-            except NoExtractableContentError as exc:
-                last_error = exc
-                if index + 1 < len(candidates):
+                digest = cache.file_digest(file_path)
+            except OSError:
+                logger.warning("Could not hash %s for the parse cache", file_path, exc_info=True)
+
+        errors: list[tuple[str, AppError]] = []
+        for index, (label, converter) in enumerate(candidates):
+            key = cache.key_for(digest, converter) if digest else ""
+            if key:
+                cached = cache.load(key)
+                if cached is not None:
+                    logger.info("Parse cache hit for %s (%s)", document.filename, label)
+                    self._last_conversion_meta = self._conversion_meta(
+                        converter, label, index, cache_hit=True
+                    )
+                    return cached
+            try:
+                result = await convert_safely(converter, str(file_path), label=label)
+            except AppError as exc:
+                errors.append((label, exc))
+                self._last_failures.append({"label": label, "error": str(exc)[:200]})
+                if index + 1 < len(candidates) and _is_recoverable(exc):
                     logger.info(
-                        "No extractable text from %s, falling back to next converter (%s)",
-                        document.filename,
+                        "Converter %s failed on %s (%s), falling back to the next candidate",
                         label,
+                        document.filename,
+                        str(exc)[:200],
                     )
                     continue
-                if not settings.mineru_enabled and document.filename.lower().endswith(".pdf"):
-                    raise AppError(
-                        "未能从 PDF 中提取任何内容（可能是扫描件）：配置 KB_MINERU_URL 并启动 "
-                        "MinerU OCR 服务后会自动走 OCR 解析"
-                    ) from exc
-                raise
-        if last_error is not None:
-            raise last_error
+                break
+            if key:
+                cache.save(key, result, source=document.filename)
+            self._last_conversion_meta = self._conversion_meta(
+                converter, label, index, cache_hit=False
+            )
+            return result
+
+        if errors:
+            _label, exc = errors[-1]
+            if (
+                isinstance(exc, NoExtractableContentError)
+                and not settings.mineru_enabled
+                and Path(document.filename).suffix.lower() == ".pdf"
+            ):
+                raise AppError(
+                    "未能从 PDF 中提取任何内容（可能是扫描件）：配置 KB_MINERU_URL 并启动 "
+                    "MinerU OCR 服务后会自动走 OCR 解析"
+                ) from exc
+            raise exc
         raise AppError(f"没有可用的转换器处理文件：{document.filename}")
+
+    def _triage(
+        self,
+        file_path: Path,
+        filename: str,
+        parse_mode: str,
+        settings: Settings,
+    ) -> TriageResult | None:
+        if not settings.conversion_triage_enabled:
+            return None
+        try:
+            result = triage_file(file_path, filename, parse_mode=parse_mode)
+        except Exception:
+            logger.warning("Conversion triage failed for %s", filename, exc_info=True)
+            return None
+        self._last_triage = result.as_report()
+        return result
+
+    @staticmethod
+    def _parse_cache(settings: Settings) -> ParseCache:
+        root = settings.document_storage_dir or ""
+        return ParseCache(
+            str(Path(root) / "_parse_cache") if root else "",
+            enabled=bool(root) and settings.parse_cache_enabled,
+        )
+
+    @staticmethod
+    def _conversion_meta(
+        converter: FileConverter, label: str, index: int, *, cache_hit: bool
+    ) -> dict:
+        return {
+            "converter": getattr(converter, "name", "") or type(converter).__name__,
+            "converter_class": type(converter).__name__,
+            "converter_version": getattr(converter, "version", ""),
+            "label": label,
+            "attempts": index + 1,
+            "fallback_used": index > 0,
+            "cache_hit": cache_hit,
+        }
+
+    def _conversion_evidence(self, converted: ConversionResult) -> dict:
+        tables = list(getattr(converted, "tables", None) or [])
+        return {
+            "triage": dict(getattr(self, "_last_triage", {}) or {}),
+            "plan": list(getattr(self, "_last_plan", []) or []),
+            "failed": list(getattr(self, "_last_failures", []) or []),
+            "page_count": converted.page_count,
+            "tables": len(tables),
+            "table_sheets": [table.sheet for table in tables][:20],
+            "ocr_pages": list(getattr(converted, "ocr_pages", None) or []),
+        }
+
+    def _store_tables(
+        self, document: Document, version: DocumentVersion, converted: ConversionResult
+    ) -> list[str]:
+        keys: list[str] = []
+        for index, table in enumerate(getattr(converted, "tables", None) or []):
+            name = f"{index:03d}-{table.sheet or 'sheet'}"
+            try:
+                payload = table.model_dump_json()
+            except Exception:
+                logger.warning("Could not serialize table %s", name, exc_info=True)
+                continue
+            try:
+                keys.append(self._storage.store_table(document.id, version.id, name, payload))
+            except Exception:
+                logger.warning("Could not store table %s", name, exc_info=True)
+        return keys
 
     @staticmethod
     def _plan_converters(
-        filename: str, parse_mode: str, settings: Settings
+        filename: str,
+        parse_mode: str,
+        settings: Settings,
+        triage: TriageResult | None = None,
+        docling_candidate: bool = False,
     ) -> list[tuple[str, FileConverter]]:
-        suffix = Path(filename).suffix.lower()
-        if suffix in IMAGE_EXTENSIONS:
-            if not settings.mineru_enabled:
-                raise AppError(
-                    "图片解析需要 MinerU OCR：请配置 KB_MINERU_URL 并启动 mineru-api 服务",
-                    status_code=503,
-                )
-            return [("ocr", MinerUConverter(settings))]
-        if parse_mode == "ocr":
-            if suffix not in {".pdf", *IMAGE_EXTENSIONS}:
-                raise AppError("强制 OCR（parse_mode=ocr）仅支持 PDF 与图片文件")
-            if not settings.mineru_enabled:
-                raise AppError(
-                    "OCR 解析需要 MinerU 服务：请配置 KB_MINERU_URL 并启动 mineru-api 服务",
-                    status_code=503,
-                )
-            return [("ocr", MinerUConverter(settings))]
-        if suffix == ".pdf":
-            candidates: list[tuple[str, FileConverter]] = [("text", PDFMarkdownConverter())]
-            if settings.mineru_enabled:
-                candidates.append(("ocr", MinerUConverter(settings)))
-            return candidates
-        return [("text", converter_for(filename))]
-
+        return plan_candidates(
+            filename,
+            parse_mode,
+            settings,
+            triage,
+            docling_candidate=docling_candidate,
+        )
     async def _embed_drafts(self, drafts: list[ChunkDraft], context: ChunkContext) -> list[ChunkRecord]:
         settings = self._settings or get_settings()
         batch_size = max(settings.embed_batch_size, 1)

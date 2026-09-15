@@ -59,6 +59,7 @@ class DocumentVersion(Base, TimestampMixin):
     chunker_version: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default=""
     )
+    conversion_report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class Conversation(Base, TimestampMixin):

@@ -81,10 +81,29 @@ class Settings(BaseSettings):
     mineru_backend: str = "pipeline"
     mineru_table_enable: bool = True
     mineru_formula_enable: bool = False
+    # Route table/formula PDFs to MinerU first (best table extraction) instead
+    # of local parsing first (much faster, weaker on complex layout).
+    mineru_prefer_complex: bool = True
 
     @property
     def mineru_enabled(self) -> bool:
         return bool(self.mineru_url.strip())
+
+    # Docling parsing service (optional). When docling_url is set, plain text
+    # PDFs are parsed by a remote docling-api service; the service is skipped
+    # automatically when it is not reachable.
+    docling_url: str = ""
+    docling_timeout_seconds: int = 1800
+    docling_ocr_enabled: bool = True
+    docling_table_mode: str = "accurate"
+
+    # Ingestion conversion behaviour
+    conversion_triage_enabled: bool = True
+    parse_cache_enabled: bool = True
+
+    @property
+    def docling_enabled(self) -> bool:
+        return bool(self.docling_url.strip())
 
     @property
     def cors_origin_list(self) -> list[str]:

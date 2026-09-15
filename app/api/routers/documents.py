@@ -161,6 +161,42 @@ async def document_detail(
     return DocumentOut.model_validate(document)
 
 
+@router.get("/documents/{document_id}/conversion-report")
+async def document_conversion_report(
+    document_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_dependency),
+) -> dict:
+    """Latest conversion report of a document (converter, triage, counts, timing)."""
+    document = await session.get(Document, document_id)
+    if document is None or document.tenant_id != tenant_id:
+        raise NotFoundError("文档不存在")
+    result = await session.execute(
+        select(DocumentVersion)
+        .where(
+            DocumentVersion.doc_id == document_id,
+            DocumentVersion.tenant_id == tenant_id,
+        )
+        .order_by(DocumentVersion.created_at.desc())
+        .limit(1)
+    )
+    version = result.scalar_one_or_none()
+    if version is None:
+        raise NotFoundError("该文档还没有处理版本")
+    return {
+        "document_id": document.id,
+        "version_id": version.id,
+        "status": version.status,
+        "stage": version.stage,
+        "doc_type": version.doc_type,
+        "parse_mode": version.parse_mode,
+        "chunker_version": version.chunker_version,
+        "chunk_count": version.chunk_count,
+        "error_message": version.error_message,
+        "conversion_report": version.conversion_report or {},
+    }
+
+
 @router.post("/documents/{document_id}/retry", status_code=202)
 async def retry_document(
     document_id: str,

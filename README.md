@@ -6,7 +6,7 @@
 
 - 知识问答：混合检索（向量 + BM25）→ 重排 → 带引用（文档名 + 页码）生成回答；无依据时拒绝猜测。
 - 多轮对话：追问改写、检索必要性判定、会话持久化、SSE 流式输出。
-- 文档接入：PDF / Word / PPT / Excel / Markdown / TXT / HTML / CSV / JSON / 图片(PNG/JPG) 统一先转为 Markdown → Markdown 切片 → bge-m3 向量化 → 写入 Milvus；PDF 保留页码定位，支持更新版本替换与失败重试。
+- 文档接入：PDF / Word / PPT / Excel / Markdown / TXT / HTML / CSV / JSON / 图片(PNG/JPG) 先经**转换分诊**选择最合适的解析路径（本地 / Docling / MinerU / 表格语义化）→ 统一转为结构块与 Markdown → 切片 → bge-m3 向量化 → 写入 Milvus；PDF 保留页码定位，支持更新版本替换与失败重试，并记录**转换报告**（转换器、分诊依据、回退、耗时、表格/图片数）。
 - 扫描件 / 复杂彩页 OCR（可选）：接入本地 MinerU 服务后，图片与无文本层的扫描 PDF 自动走 OCR，复杂版式彩页手册可上传时强制 OCR（`ocr=true`）。
 - 预留扩展位：`tenant_id`、审计事件、答案反馈均落表，业务逻辑后续迭代。
 
@@ -82,6 +82,10 @@ alembic upgrade head
 | `KB_MINERU_BACKEND` | MinerU 后端，CPU 期用 `pipeline`（默认），GPU 升级后可按需切 VLM/hybrid |
 | `KB_MINERU_TIMEOUT_SECONDS` / `KB_MINERU_POLL_INTERVAL` | OCR 任务超时与轮询间隔（默认 3600s / 3s） |
 | `KB_MINERU_LANG` / `KB_MINERU_TABLE_ENABLE` / `KB_MINERU_FORMULA_ENABLE` | OCR 语言（默认 ch）、是否启用表格/公式解析 |
+| `KB_MINERU_PREFER_COMPLEX` | 含表格/公式的 PDF 是否优先走 MinerU（默认 true；CPU OCR 较慢时可设 false 改成本地优先） |
+| `KB_DOCLING_URL` | Docling 解析服务地址（如 `http://127.0.0.1:8003`）；留空则跳过该候选 |
+| `KB_DOCLING_OCR_ENABLED` / `KB_DOCLING_TABLE_MODE` | Docling 的 OCR 开关与表格模式（`fast`/`accurate`） |
+| `KB_CONVERSION_TRIAGE_ENABLED` / `KB_PARSE_CACHE_ENABLED` | 转换分诊与解析缓存开关（默认均开启） |
 
 ## GPU 推理（可选）
 
@@ -142,6 +146,55 @@ export MINERU_MODEL_SOURCE=modelscope   # 国内下载模型权重
 
 然后把 `KB_MINERU_URL` 指向该服务即可。本系统只需 MinerU 提供 `/health`、`/tasks`、`/tasks/{id}`、`/tasks/{id}/result` 接口。
 
+## 文档转换分诊与解析缓存
+
+入库前会先做一次**轻量分诊**（`app/ingestion/triage.py`）：PDF 按页判断文字层、图片与表格，再决定用哪个转换器；分诊结论与最终路由（`triage` / `plan`）会写入该文档版本的**转换报告**。
+
+| 文件特征 | 首选转换器 | 回退顺序 |
+|---|---|---|
+| 无文字层（扫描件） | MinerU OCR | 本地解析 |
+| 部分页面无文字层 | 混合解析：文字页本地 + 扫描页单独 OCR | MinerU 整篇 OCR → 本地 |
+| 含表格/公式的 PDF | MinerU（`KB_MINERU_PREFER_COMPLEX=false` 改成本地优先） | Docling → 本地 |
+| 普通文字 PDF | Docling（未配置则本地） | 本地解析 → OCR |
+| DOCX | python-docx（标题层级 + 图片按章节挂载） | MinerU |
+| XLSX | 表格语义化（按 sheet 分节、逐行「字段=值」） | MarkItDown → MinerU |
+| PPTX / HTML / CSV / JSON / MD / TXT | MarkItDown / 直读 | —— |
+| 图片 | MinerU OCR | —— |
+
+- **首选失败按顺序回退**：只有“转换器不可用 / 无法提取内容 / 上游失败”才回退；文件本身损坏或加密会立即报错，不会再去跑几分钟 OCR。
+- **转换报告**：`GET /api/v1/documents/{id}/conversion-report` 返回转换器与版本、分诊依据、回退链与失败原因、页数、表格数、图片数、耗时与缓存命中情况。
+- **解析缓存**：键为「文件 sha256 + 转换器 + 版本 + 参数」，落在 `data/documents/_parse_cache/`；重复入库同一文件直接复用，转换器升级或参数变化自动失效（删除该目录即强制重解析）。
+- XLSX 等表格文档的原始网格作为元数据写入 `data/documents/<doc>/<ver>/tables/*.json`，只用于后续行级切片，**不额外进入向量库**，避免同一内容重复索引。
+
+### Docling 解析服务（可选，独立 HTTP 服务）
+
+与 MinerU 同构：Docling 跑在独立容器里，worker 通过 HTTP 调用（`KB_DOCLING_URL`）；服务不可用时自动跳过该候选，不影响转换完成。
+
+```bash
+# 1) 构建镜像（首次拉取 docling 依赖，体量较大）
+docker build -f docker/docling/Dockerfile -t docling-api .
+
+# 2) 启动服务（compose profile: docling，宿主端口 8003）
+docker compose --profile docling up -d docling-api
+
+# 3) .env 指向服务后重启 api / worker
+#   KB_DOCLING_URL=http://127.0.0.1:8003
+```
+
+服务接口：`GET /health` 与 `POST /convert`（multipart `files` + `to_formats` / `do_ocr` / `table_mode` / `return_blocks`），返回 `{markdown, page_count, blocks[]}`。
+
+### 转换基线评测
+
+```bash
+uv run python scripts/eval_conversion.py --samples data/conversion_eval             # 本地解析基线
+uv run python scripts/eval_conversion.py --samples data/conversion_eval --docling   # 叠加 Docling 对比
+uv run python scripts/eval_conversion.py --samples data/conversion_eval --ocr       # 叠加 MinerU（CPU 慢）
+```
+
+输出每个样例的分诊结果、各候选转换器的耗时/块数/表格数/图片数与汇总，并写入 `<samples>/conversion_results.json`；检索侧对比仍用 `scripts/eval_recall.py`。把几份真实文档放进 `data/conversion_eval` 即可复现基线。
+
+参考基线（本机，189KB 制度类 PDF）：本地解析约 0.5s / 177 个结构块 / 6 张表格；DOCX 约 30–200ms。引入 Docling 的收益用同一脚本 `--docling` 对比即可量化。
+
 ## 图片证据（抽取与展示）
 
 含图文档入库时会抽取图片（MinerU 的 ZIP/content_list，或本地 PyMuPDF/Office 兜底）、按内容哈希去重并过滤装饰性小图；图片以 `document_images` 记录并与文档版本绑定。图片切片带 `image_id`，检索命中后引用中会返回 `images: [{image_id, url, caption}]`，前端在引用区展示缩略图、在文档页可浏览该文档的全部图片。
@@ -153,7 +206,7 @@ export MINERU_MODEL_SOURCE=modelscope   # 国内下载模型权重
 ## 主要 API
 
 - `POST /api/v1/documents`：上传 PDF / Word / PPT / Excel / Markdown / TXT / HTML / CSV / JSON / 图片(PNG/JPG)（立即受理，后台先转 Markdown 再入库）；可带 `?ocr=true` 强制走 MinerU OCR
-- `GET /api/v1/documents`、`GET /api/v1/documents/{id}`、`POST /api/v1/documents/{id}/retry`
+- `GET /api/v1/documents`、`GET /api/v1/documents/{id}`、`GET /api/v1/documents/{id}/conversion-report`（转换报告）、`POST /api/v1/documents/{id}/retry`
 - `POST /api/v1/chat/stream`：SSE 流式问答（`message` + 可选 `conversation_id`）
 - `POST /api/v1/conversations`、`GET /api/v1/conversations`、`GET /api/v1/conversations/{id}/messages`
 - `POST /api/v1/feedback`：答案反馈占位
@@ -181,7 +234,7 @@ scripts/       init-models.sh 等
 ## 二次开发指引
 
 - **换模型**：只替换 `app/providers/factory.py` 对应工厂的实现；接口见 `app/providers/base.py`。GPU 部署见上文「GPU 推理（可选）」。
-- **OCR 与解析器**：`app/ingestion/mineru.py` 是 MinerU HTTP 客户端，`app/ingestion/pipeline.py` 的 `_plan_converters` 决定路由（auto：文字 PDF→扫描回退 OCR；ocr：直接 OCR）。旧文档解析失败后调用重试即走新解析。
+- **OCR 与解析器**：`app/ingestion/triage.py` 负责分诊与路由（`plan_candidates`），`app/ingestion/mineru.py` / `app/ingestion/docling.py` 是两个独立解析服务的 HTTP 客户端，`app/ingestion/tabular.py` 做 XLSX 语义化，`app/ingestion/cache.py` 是内容寻址的解析缓存。调整路由只改 `triage.plan_candidates` 一处。旧文档解析失败后调用重试即走新解析。
 - **换向量库 / 检索策略**：`app/retrieval/milvus_store.py` 是唯一直接触碰 Milvus 的地方。
 - **多租户 / 权限 / 审计 / 反馈**：所有表与集合均带 `tenant_id`；`app/chat/service.py` 的审计与反馈写入已预留，后续只需增加鉴权中间件与业务规则。
 - **LangSmith / trace**：模型 provider 与图节点中已留出埋点位；本期使用结构化日志，无需改接口即可后续接入。

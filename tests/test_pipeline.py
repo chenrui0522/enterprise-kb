@@ -302,3 +302,54 @@ async def test_pipeline_warns_when_image_extraction_fails(tmp_path, monkeypatch)
         await session.refresh(version)
         assert version.status == "ready"
         assert (version.error_message or "").startswith("warning:")
+
+@pytest.mark.asyncio
+async def test_pipeline_records_conversion_report(tmp_path) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    pdf = tmp_path / "report.pdf"
+    _write_pdf(str(pdf), "Conversion report smoke content for ZB-100.")
+
+    storage = FileDocumentStorage(str(tmp_path / "docs"))
+    pipeline = IngestionPipeline(store=FakeStore(), embedder=FakeEmbedder(), storage=storage)
+
+    async with session_factory() as session:
+        document = Document(tenant_id="t1", title="报告样例", filename="report.pdf")
+        session.add(document)
+        await session.flush()
+        version = DocumentVersion(
+            tenant_id="t1",
+            doc_id=document.id,
+            storage_key=storage.store(document.id, "v1", "report.pdf", pdf.read_bytes()),
+            doc_type="generic",
+        )
+        session.add(version)
+        await session.commit()
+
+        await pipeline.process_job(
+            session,
+            {"doc_id": document.id, "version_id": version.id, "tenant_id": "t1", "storage_key": version.storage_key},
+            chunk_size=300,
+            overlap=30,
+        )
+        await session.refresh(version)
+        report = version.conversion_report
+        assert report and report["converter"]
+        assert report["attempts"] >= 1
+        assert report["markdown_chars"] > 0
+        assert "elapsed_ms" in report
+        # Report contract: converter identity, triage evidence and counts are
+        # all queryable from the document version.
+        assert report["converter_version"]
+        assert report["label"] in {"text", "ocr", "docling", "hybrid", "xlsx"}
+        assert report["cache_hit"] is False
+        assert report["page_count"] == 1
+        assert report["tables"] == 0
+        assert report["images"] == 0
+        assert report["plan"][0] == report["label"]
+        assert report["triage"]["kind"] == "pdf_text"
+        assert report["failed"] == []
+        assert report["table_files"] == []

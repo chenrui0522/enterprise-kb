@@ -112,3 +112,66 @@ def test_document_image_endpoint_serves_file(monkeypatch, tmp_path) -> None:
     fake_image.tenant_id = "other"
     with pytest.raises(NotFoundError):
         client.get("/api/v1/documents/d1/images/img1")
+
+
+def test_conversion_report_endpoint(monkeypatch, tmp_path) -> None:
+    import types
+
+    from app.models.entity import Document
+
+    document = types.SimpleNamespace(id="d1", tenant_id="t1")
+    version = types.SimpleNamespace(
+        id="v1",
+        status="ready",
+        stage="ready",
+        doc_type="policy",
+        parse_mode="auto",
+        chunker_version="structure-v1:policy",
+        chunk_count=12,
+        error_message=None,
+        conversion_report={
+            "converter": "pdf-local",
+            "converter_version": "1",
+            "label": "text",
+            "attempts": 1,
+            "fallback_used": False,
+            "cache_hit": False,
+            "elapsed_ms": 42,
+            "page_count": 3,
+            "tables": 0,
+            "images": 2,
+            "triage": {"kind": "pdf_text"},
+        },
+    )
+
+    class _Result:
+        def scalar_one_or_none(self):
+            return version
+
+    class ReportSession(FakeSession):
+        async def get(self, model, ident):  # noqa: ARG002
+            return document if model is Document else None
+
+        async def execute(self, statement):  # noqa: ARG002
+            return _Result()
+
+    client = _client(monkeypatch, tmp_path, ReportSession())
+    response = client.get("/api/v1/documents/d1/conversion-report")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["version_id"] == "v1"
+    assert payload["conversion_report"]["converter"] == "pdf-local"
+    assert payload["conversion_report"]["triage"]["kind"] == "pdf_text"
+    assert payload["chunk_count"] == 12
+
+
+def test_conversion_report_missing_document(monkeypatch, tmp_path) -> None:
+    from app.core.errors import NotFoundError
+
+    class EmptySession(FakeSession):
+        async def get(self, model, ident):  # noqa: ARG002
+            return None
+
+    client = _client(monkeypatch, tmp_path, EmptySession())
+    with pytest.raises(NotFoundError):
+        client.get("/api/v1/documents/d1/conversion-report")

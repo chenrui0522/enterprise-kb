@@ -49,6 +49,21 @@ class DocumentStructure(BaseModel):
     degraded: bool = False
 
 
+class TableArtifact(BaseModel):
+    """Structured grid kept as metadata (never indexed as one big table blob).
+
+    Table documents (XLSX and comparable sources) are indexed through
+    per-row semantic text; the original grid is persisted next to the
+    document so later chunking strategies can rebuild row-level chunks.
+    """
+
+    sheet: str = ""
+    header: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+    source: str = ""
+    start_row: int = 0
+
+
 @dataclass
 class _PendingParagraph:
     lines: list[str]

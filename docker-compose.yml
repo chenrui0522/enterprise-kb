@@ -109,6 +109,8 @@ services:
       KB_DOCUMENT_STORAGE_DIR: /srv/data/documents
       # Enable MinerU OCR by uncommenting after `docker compose --profile mineru up -d`:
       # KB_MINERU_URL: http://mineru-api:8000
+      # Enable Docling by uncommenting after `docker compose --profile docling up -d`:
+      # KB_DOCLING_URL: http://docling-api:8000
     volumes:
       - ./data:/srv/data
     ports:
@@ -135,6 +137,8 @@ services:
       KB_DOCUMENT_STORAGE_DIR: /srv/data/documents
       # Enable MinerU OCR by uncommenting after `docker compose --profile mineru up -d`:
       # KB_MINERU_URL: http://mineru-api:8000
+      # Enable Docling by uncommenting after `docker compose --profile docling up -d`:
+      # KB_DOCLING_URL: http://docling-api:8000
     volumes:
       - ./data:/srv/data
     depends_on:
@@ -144,6 +148,35 @@ services:
         condition: service_healthy
       milvus:
         condition: service_healthy
+
+  # Optional Docling parsing service for plain text PDFs / office documents.
+  # Not started by default. Host port 8003 lets a local dev worker call
+  # http://127.0.0.1:8003 without changing anything else.
+  docling-api:
+    image: ${DOCLING_IMAGE:-docling-api:latest}
+    restart: unless-stopped
+    profiles: ["docling"]
+    ports:
+      - "8003:8000"
+    environment:
+      DOCLING_ARTIFACTS_PATH: /opt/docling-cache
+      # DOCLING_DEVICE: cpu          # set to cuda on GPU hosts
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    volumes:
+      - docling-cache:/opt/docling-cache
+    # GPU deployments: uncomment below and set device ids (driver must exist).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           device_ids: ["0"]
+    #           capabilities: [gpu]
 
   # Optional MinerU OCR worker for scanned PDFs / images / complex layout manuals.
   # Not started by default (CPU/GPU image is built separately - see README).
@@ -183,3 +216,4 @@ volumes:
   milvus:
   xinference-cache:
   mineru-home:
+  docling-cache:
