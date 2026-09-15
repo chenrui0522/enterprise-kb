@@ -12,6 +12,9 @@ class ChatState(TypedDict):
     history: list[dict]
     rewritten_query: str
     need_retrieval: bool
+    # Optional metadata filter (doc_type / table_id / heading_path prefix ...);
+    # applied as a Milvus expr on both retrieval routes, never as a ranked route.
+    filters: dict
     hits: list[dict]
     citations: list[dict]
     answer: str

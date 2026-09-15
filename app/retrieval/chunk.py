@@ -17,6 +17,8 @@ class ChunkRecord(BaseModel):
     tenant_id: str
     vector: list[float] = Field(default_factory=list)
     chunk_type: str = "text"
+    chunk_kind: str = "child"
+    doc_type: str = ""
     heading_path: str = ""
     clause_no: str = ""
     step_no: str = ""
@@ -24,6 +26,7 @@ class ChunkRecord(BaseModel):
     table_id: str = ""
     row_start: int = 0
     row_end: int = 0
+    row_index: int = 0
     parent_id: str = ""
     chunker_version: str = ""
     image_id: str = ""
@@ -39,6 +42,8 @@ class SearchHit(BaseModel):
     text: str
     score: float
     chunk_type: str = "text"
+    chunk_kind: str = "child"
+    doc_type: str = ""
     heading_path: str = ""
     clause_no: str = ""
     step_no: str = ""
@@ -46,6 +51,7 @@ class SearchHit(BaseModel):
     table_id: str = ""
     row_start: int = 0
     row_end: int = 0
+    row_index: int = 0
     parent_id: str = ""
     chunker_version: str = ""
     image_id: str = ""

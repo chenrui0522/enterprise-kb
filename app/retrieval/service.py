@@ -33,10 +33,17 @@ class SearchService:
         self._redis = redis
         self._rerank_semaphore = asyncio.Semaphore(settings.rerank_max_concurrency)
 
-    async def search(self, query: str, tenant_id: str) -> list[SearchHit]:
+    async def search(
+        self, query: str, tenant_id: str, filters: dict | None = None
+    ) -> list[SearchHit]:
+        """Hybrid search (dense + BM25 -> RRF) with optional metadata filters.
+
+        `filters` narrows both routes through a Milvus `expr`; it never adds a
+        ranked route, so the fusion semantics stay unchanged.
+        """
         top_n = self._settings.retrieval_top_n
         top_k = self._settings.retrieval_top_k
-        cache_key = self._cache_key(query, tenant_id, top_n, top_k)
+        cache_key = self._cache_key(query, tenant_id, top_n, top_k, filters)
         cached = await self._redis.get(cache_key)
         if cached:
             try:
@@ -45,7 +52,7 @@ class SearchService:
                 logger.warning("Ignored corrupted retrieval cache entry")
 
         query_vector = (await self._embedder.embed([query]))[0]
-        candidates = self._store.hybrid_search(query, query_vector, tenant_id, top_n)
+        candidates = self._store.hybrid_search(query, query_vector, tenant_id, top_n, filters)
         hits = await self._rank(query, candidates, top_k)
         try:
             payload = json.dumps([hit.model_dump() for hit in hits], ensure_ascii=False)
@@ -70,8 +77,18 @@ class SearchService:
         hits = [hit for hit, score in ranked if score >= min_score][:top_k]
         return hits
 
-    def _cache_key(self, query: str, tenant_id: str, top_n: int, top_k: int) -> str:
-        digest = hashlib.sha1(f"{tenant_id}|{query}|{top_n}|{top_k}".encode("utf-8")).hexdigest()
+    def _cache_key(
+        self,
+        query: str,
+        tenant_id: str,
+        top_n: int,
+        top_k: int,
+        filters: dict | None = None,
+    ) -> str:
+        filter_key = json.dumps(filters or {}, sort_keys=True, ensure_ascii=False)
+        digest = hashlib.sha1(
+            f"{tenant_id}|{query}|{top_n}|{top_k}|{filter_key}".encode("utf-8")
+        ).hexdigest()
         return f"kb:retrieval:{digest}"
 
 
@@ -86,6 +103,8 @@ def _to_hit(candidate: dict) -> SearchHit:
         text=candidate.get("text", ""),
         score=float(candidate.get("score") or 0.0),
         chunk_type=candidate.get("chunk_type", "") or "text",
+        chunk_kind=candidate.get("chunk_kind", "") or "child",
+        doc_type=candidate.get("doc_type", "") or "",
         heading_path=candidate.get("heading_path", "") or "",
         clause_no=candidate.get("clause_no", "") or "",
         step_no=candidate.get("step_no", "") or "",
@@ -93,6 +112,7 @@ def _to_hit(candidate: dict) -> SearchHit:
         table_id=candidate.get("table_id", "") or "",
         row_start=int(candidate.get("row_start") or 0),
         row_end=int(candidate.get("row_end") or 0),
+        row_index=int(candidate.get("row_index") or 0),
         parent_id=candidate.get("parent_id", "") or "",
         chunker_version=candidate.get("chunker_version", "") or "",
         image_id=candidate.get("image_id", "") or "",

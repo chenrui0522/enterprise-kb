@@ -38,6 +38,11 @@ class Block(BaseModel):
     header: list[str] = Field(default_factory=list)
     items: list[str] = Field(default_factory=list)
     image_id: str = ""
+    #: Table identity for row-level semantic blocks (spreadsheets); when set,
+    #: the block is indexed as table rows instead of prose.
+    table_id: str = ""
+    #: 1-based index of the first data row covered by this block.
+    row_start: int = 0
     # Source position for formats that expose layout (PDF); 0 when unknown.
     y0: float = 0.0
     x0: float = 0.0

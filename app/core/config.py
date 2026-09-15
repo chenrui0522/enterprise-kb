@@ -65,6 +65,17 @@ class Settings(BaseSettings):
     embed_batch_size: int = 32
     history_turns: int = 5
 
+    # Parent-child chunking (chunker_version=structure-v2). Parent size is the
+    # generation-side context; child size/overlap stay the retrieval geometry.
+    parent_child_enabled: bool = True
+    parent_size: int = 2400
+    table_row_group: int = 1
+    table_repeat_header: bool = True
+    #: Generation-side budget for expanded parent context (approximate tokens,
+    #: converted at ~2 characters per token for CJK-heavy corpora).
+    parent_token_budget: int = 1200
+    max_parents_per_answer: int = 6
+
     # Document storage & queue
     document_storage_dir: str = "./data/documents"
     queue_key: str = "kb:ingestion:jobs"

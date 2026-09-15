@@ -26,7 +26,7 @@ from app.core.logging import get_logger
 from app.core.ratelimit import check_rate_limit
 from app.core.redis import get_redis
 from app.core.tenant import tenant_dependency
-from app.models.entity import DocumentImage, Message
+from app.models.entity import DocumentImage, DocumentTable, Message
 from app.schemas.chat import (
     ChatRequest,
     CitationImageOut,
@@ -118,6 +118,39 @@ async def _attach_citation_images(
         if version_id:
             images = [entry for entry in images if entry["version_id"] == version_id]
         item["images"] = images[:MAX_IMAGES_PER_CITATION]
+
+
+async def _attach_citation_tables(
+    session: AsyncSession, tenant_id: str, citations: list[dict]
+) -> None:
+    """Attach the table asset behind a table row/summary citation.
+
+    The citation still points at the retrieved row (D8); the table payload is
+    only there so the UI can show the surrounding grid.
+    """
+    table_ids = sorted({item.get("table_id") for item in citations if item.get("table_id")})
+    if not table_ids:
+        return
+    result = await session.execute(
+        select(DocumentTable).where(
+            DocumentTable.tenant_id == tenant_id, DocumentTable.id.in_(table_ids)
+        )
+    )
+    mapping = {
+        table.id: {
+            "table_id": table.id,
+            "name": table.name,
+            "header": list(table.header or []),
+            "row_count": table.row_count,
+            "summary": table.summary or "",
+            "url": f"/api/v1/documents/{table.doc_id}/tables/{table.id}",
+        }
+        for table in result.scalars()
+    }
+    for item in citations:
+        payload = mapping.get(item.get("table_id") or "")
+        if payload:
+            item["table"] = payload
 
 
 async def _load_citation_images(
@@ -308,6 +341,7 @@ async def _chat_event_stream(graph: ChatGraph, payload: ChatRequest, tenant_id: 
             )
         async with session_factory() as session:
             await _attach_citation_images(session, tenant_id, citations)
+            await _attach_citation_tables(session, tenant_id, citations)
 
         yield sse_event(
             {

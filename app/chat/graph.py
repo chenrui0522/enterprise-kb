@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
@@ -67,10 +69,13 @@ class ChatGraph:
         search_service: SearchService,
         history_turns: int = 5,
         checkpointer=None,
+        parent_expander: Callable[[list[dict]], Awaitable[list[dict]]] | None = None,
     ) -> None:
         self._llm = llm
         self._search_service = search_service
         self._history_turns = history_turns
+        # Swaps retrieved child chunks for their parent context (design D7).
+        self._parent_expander = parent_expander
         self._graph = self._build(checkpointer=checkpointer)
 
     def _build(self, checkpointer=None):
@@ -135,8 +140,12 @@ class ChatGraph:
 
     async def _retrieve(self, state: ChatState) -> dict:
         query = state.get("rewritten_query") or state["user_question"]
-        hits = await self._search_service.search(query, state["tenant_id"])
-        return {"hits": [hit.model_dump() for hit in hits]}
+        filters = state.get("filters") or None
+        hits = await self._search_service.search(query, state["tenant_id"], filters=filters)
+        payload = [hit.model_dump() for hit in hits]
+        if self._parent_expander is not None and payload:
+            payload = await self._parent_expander(payload)
+        return {"hits": payload}
 
     async def _direct_answer(self, state: ChatState) -> dict:
         question = state["user_question"]
@@ -172,10 +181,13 @@ class ChatGraph:
         references = []
         citations = []
         for index, hit in enumerate(hits, start=1):
+            # Generation uses the parent context when available (小块检索、大块生成);
+            # citations keep pointing at the retrieved child for precision.
+            context_text = hit.get("context_text") or hit["text"]
             references.append(
                 f"[{index}]《{hit['title']}》第{hit['page']}页"
                 + (f"（{hit['section']}）" if hit.get("section") else "")
-                + f"：{hit['text']}"
+                + f"：{context_text}"
             )
             citations.append(
                 {
@@ -187,6 +199,10 @@ class ChatGraph:
                     "image_id": hit.get("image_id") or None,
                     "version_id": hit.get("version_id") or None,
                     "heading_path": hit.get("heading_path") or None,
+                    "chunk_kind": hit.get("chunk_kind") or "child",
+                    "table_id": hit.get("table_id") or None,
+                    "row_index": int(hit.get("row_index") or 0),
+                    "parent_id": hit.get("parent_id") or None,
                 }
             )
         system = GENERATE_SYSTEM_TEMPLATE.format(references="\n".join(references))

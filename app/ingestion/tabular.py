@@ -311,11 +311,18 @@ def _row_blocks(
     header_row: int,
     rows_per_group: int,
 ) -> list[Block]:
+    """Grouped markdown-ish row lines for the parent blocks.
+
+    `text` keeps the grouped, human-readable form used in Markdown/citations; the
+    table identity plus the per-row `items` let the parent-child chunker emit one
+    row-level retrieval chunk per data row without duplicating the grid.
+    """
     blocks: list[Block] = []
     total = len(rows)
     for start in range(0, total, rows_per_group):
         group = rows[start : start + rows_per_group]
-        lines = []
+        lines: list[str] = []
+        row_lines: list[str] = []
         if total > rows_per_group:
             lines.append(
                 f"工作表：{sheet_name}（第 {header_row + start + 2}-{header_row + start + 1 + len(group)} 行）"
@@ -329,12 +336,18 @@ def _row_blocks(
             ]
             if not pairs:
                 continue
-            lines.append(f"第 {header_row + offset + 2} 行：" + "；".join(pairs))
-        if any(line.startswith("第 ") for line in lines):
+            line = f"第 {header_row + offset + 2} 行：" + "；".join(pairs)
+            lines.append(line)
+            row_lines.append(line)
+        if row_lines:
             blocks.append(
                 Block(
                     type=BLOCK_PARAGRAPH,
                     text="\n".join(lines),
+                    items=row_lines,
+                    header=list(header),
+                    table_id=sheet_name,
+                    row_start=start + 1,
                 )
             )
     return blocks

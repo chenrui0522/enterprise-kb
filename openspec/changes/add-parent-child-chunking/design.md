@@ -1,4 +1,4 @@
-﻿## Context
+## Context
 
 见 proposal.md。现状：`ChunkDraft`/`ChunkRecord` 已有 `parent_id`、`heading_path`、`table_id`、`image_id`、`row_start/row_end`（部分未使用）；Milvus 已实现 dense + BM25 两路 RRF 融合与 rerank；`document_images` 已独立存储图片；表格目前以整张 Markdown 进切片。
 
@@ -27,7 +27,9 @@
 
 ### D4 统一 chunk schema
 
-所有进 Milvus 的 chunk 共用字段：`id, text, title, doc_id, version_id, chunk_index, page, section, tenant_id, chunk_kind, chunk_type, heading_path, parent_id, table_id, row_index, image_id, chunker_version, dense, sparse`。`chunk_kind ∈ {child, table_row, table_summary, image}`。
+所有进 Milvus 的 chunk 共用字段：`id, text, title, doc_id, version_id, chunk_index, page, section, tenant_id, chunk_kind, chunk_type, doc_type, heading_path, parent_id, table_id, row_index, image_id, chunker_version, dense, sparse`。`chunk_kind ∈ {child, table_row, table_summary, image}`。
+
+`doc_type` 与 `chunk_kind` 同为标量列，供 `expr` 元数据过滤使用（D5）。
 
 ### D5 检索：两路 RRF + 元数据过滤
 

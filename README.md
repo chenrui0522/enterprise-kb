@@ -6,6 +6,7 @@
 
 - 知识问答：混合检索（向量 + BM25）→ 重排 → 带引用（文档名 + 页码）生成回答；无依据时拒绝猜测。
 - 多轮对话：追问改写、检索必要性判定、会话持久化、SSE 流式输出。
+- 父子分块（`structure-v2`）：**小块检索、大块生成** —— Milvus 只存子块（与表格行/摘要、图片块），父块（标题子树）存 PostgreSQL，命中子块后按 `parent_id` 展开父块送生成，引用仍指向子块位置。
 - 文档接入：PDF / Word / PPT / Excel / Markdown / TXT / HTML / CSV / JSON / 图片(PNG/JPG) 先经**转换分诊**选择最合适的解析路径（本地 / Docling / MinerU / 表格语义化）→ 统一转为结构块与 Markdown → 切片 → bge-m3 向量化 → 写入 Milvus；PDF 保留页码定位，支持更新版本替换与失败重试，并记录**转换报告**（转换器、分诊依据、回退、耗时、表格/图片数）。
 - 扫描件 / 复杂彩页 OCR（可选）：接入本地 MinerU 服务后，图片与无文本层的扫描 PDF 自动走 OCR，复杂版式彩页手册可上传时强制 OCR（`ocr=true`）。
 - 预留扩展位：`tenant_id`、审计事件、答案反馈均落表，业务逻辑后续迭代。
@@ -86,6 +87,10 @@ alembic upgrade head
 | `KB_DOCLING_URL` | Docling 解析服务地址（如 `http://127.0.0.1:8003`）；留空则跳过该候选 |
 | `KB_DOCLING_OCR_ENABLED` / `KB_DOCLING_TABLE_MODE` | Docling 的 OCR 开关与表格模式（`fast`/`accurate`） |
 | `KB_CONVERSION_TRIAGE_ENABLED` / `KB_PARSE_CACHE_ENABLED` | 转换分诊与解析缓存开关（默认均开启） |
+| `KB_CHUNKER_VERSION` | 切片器版本：`structure-v2`（父子分块，默认）/ `structure-v1`（回滚） |
+| `KB_PARENT_SIZE` / `KB_PARENT_CHILD_ENABLED` | 父块字符上限与父子分块总开关 |
+| `KB_TABLE_ROW_GROUP` / `KB_TABLE_REPEAT_HEADER` | 表格行块分组与是否重复表头 |
+| `KB_PARENT_TOKEN_BUDGET` / `KB_MAX_PARENTS_PER_ANSWER` | 生成端父块上下文预算（近似 token）与父块数量上限 |
 
 ## GPU 推理（可选）
 
@@ -195,6 +200,51 @@ uv run python scripts/eval_conversion.py --samples data/conversion_eval --ocr   
 
 参考基线（本机，189KB 制度类 PDF）：本地解析约 0.5s / 177 个结构块 / 6 张表格；DOCX 约 30–200ms。引入 Docling 的收益用同一脚本 `--docling` 对比即可量化。
 
+## 父子分块与表格两级处理（`structure-v2`）
+
+**小块检索、大块生成**：检索命中精度来自子块，回答质量来自父块上下文。
+
+| 存储 | 内容 |
+|---|---|
+| Milvus（可检索） | 子块（`chunk_kind=child`）、表格行级块（`table_row`）、表级摘要块（`table_summary`）、图片块（`image`） |
+| PostgreSQL | 父块全文（`chunk_parents`，按 `parent_id` 取回）、表格元数据（`document_tables`） |
+| 对象存储（本地） | `images/` 原图、`tables/` 整表 JSON |
+
+- **父块 = 标题子树**：按 Markdown 标题层级切分并记录 `heading_path`；子树超过 `KB_PARENT_SIZE` 时在子树内切二级父块，章节路径保持一致。
+- **子块在父块内递归切分**：子块永远不跨父块，携带 `parent_id`；`policy`/`sop`/`faq` 仍按条款/步骤/问答对生成子块，只有 `generic` 走纯递归窗口。
+- **表格不参与父子**：每个数据行生成一条「字段=值」行块（含 `table_id`、`row_index`），另有一条确定性**表级摘要**块（表名、列、行数、章节、示例）。整表网格只作元数据落 `tables/*.json`，不再以整张 Markdown 表进索引。
+- **图片**沿用现方案（原图 + caption/OCR 文本进切片），`chunk_kind=image`，后续升级 VLM 描述。
+- **统一 chunk schema**：`chunk_kind / doc_type / parent_id / table_id / row_index / heading_path / image_id ...`，所有进 Milvus 的块共用一套字段。
+
+### 检索与生成
+
+- 检索保持**两路召回（向量 + BM25）→ RRF 融合 → Rerank**；元数据（`doc_type`、`heading_path` 前缀、`table_id`、`image_id`、页码等）以 Milvus `expr` **过滤**加在两路上，不作为第三路排名——「符合条件」不等于「相关」，混入 RRF 会污染排序。
+- 生成端按 `parent_id` 取父块：**同一父块只展开一次**，总量受 `KB_PARENT_TOKEN_BUDGET` 限制，超长父块截断（`…`）；表格/图片块用自身文本，不展开父块。
+- 引用保持**子块精度**（页码 / 条款号 / 步骤号 / 表格行号），并携带图片与表格资产：表格引用附带 `table` 元数据与 `/documents/{id}/tables/{table_id}` 取回链接。
+
+### 按文档类型参数化
+
+| doc_type | 父块 | 子块 | 说明 |
+|---|---|---|---|
+| `generic` | 标题子树（2400 字符） | 递归窗口（800/80） | 默认 |
+| `policy` | 2000 | 条款（600/60） | 第 X 条 / 编号条款 |
+| `sop` | 2000 | 步骤（600/60） | 第 X 步 / 数字步骤 |
+| `faq` | 3000 | 问答对（1000/0） | 一问一答为一个子块 |
+| `table` | 不启用 | 行级 + 摘要 | 表格文档（XLSX 等） |
+
+数值随 `KB_CHUNK_SIZE`/`KB_CHUNK_OVERLAP` 等比缩放，可用上表 env 覆盖。
+
+### 切换与重导
+
+```bash
+# .env：KB_CHUNKER_VERSION=structure-v2、KB_MILVUS_COLLECTION=kb_chunks_v4
+uv run alembic upgrade head                                   # 新增 chunk_parents / document_tables
+uv run python -m app.reindex --dry-run                        # 先看清单
+uv run python -m app.reindex --wait --timeout 3600            # 全量重导（复用解析缓存）
+```
+
+重导完成后核对每个版本的 `chunks / parents / tables`（`--wait` 输出里直接打印）。回滚：把 `KB_CHUNKER_VERSION` 改回 `structure-v1` 并使用旧集合 `kb_chunks_v3`。
+
 ## 图片证据（抽取与展示）
 
 含图文档入库时会抽取图片（MinerU 的 ZIP/content_list，或本地 PyMuPDF/Office 兜底）、按内容哈希去重并过滤装饰性小图；图片以 `document_images` 记录并与文档版本绑定。图片切片带 `image_id`，检索命中后引用中会返回 `images: [{image_id, url, caption}]`，前端在引用区展示缩略图、在文档页可浏览该文档的全部图片。
@@ -207,6 +257,7 @@ uv run python scripts/eval_conversion.py --samples data/conversion_eval --ocr   
 
 - `POST /api/v1/documents`：上传 PDF / Word / PPT / Excel / Markdown / TXT / HTML / CSV / JSON / 图片(PNG/JPG)（立即受理，后台先转 Markdown 再入库）；可带 `?ocr=true` 强制走 MinerU OCR
 - `GET /api/v1/documents`、`GET /api/v1/documents/{id}`、`GET /api/v1/documents/{id}/conversion-report`（转换报告）、`POST /api/v1/documents/{id}/retry`
+- `GET /api/v1/documents/{id}/tables`、`GET /api/v1/documents/{id}/tables/{table_id}`（表格元数据与整表行数据，供引用侧展示）
 - `POST /api/v1/chat/stream`：SSE 流式问答（`message` + 可选 `conversation_id`）
 - `POST /api/v1/conversations`、`GET /api/v1/conversations`、`GET /api/v1/conversations/{id}/messages`
 - `POST /api/v1/feedback`：答案反馈占位
@@ -219,7 +270,7 @@ SSE 事件：`message_start` → `token`* → (`error`) → `done`。`done` 携�
 ```
 app/
   api/         路由、SSE、中间件、应用组装
-  chat/        LangGraph 状态与节点、会话仓库服务
+  chat/        LangGraph 状态与节点、会话仓库服务、父块上下文展开
   retrieval/   Milvus schema/混合检索、重排、缓存
   ingestion/   parser 接口、chunker、本地存储、队列、流水线
   worker/      接入 worker 入口
@@ -235,6 +286,7 @@ scripts/       init-models.sh 等
 
 - **换模型**：只替换 `app/providers/factory.py` 对应工厂的实现；接口见 `app/providers/base.py`。GPU 部署见上文「GPU 推理（可选）」。
 - **OCR 与解析器**：`app/ingestion/triage.py` 负责分诊与路由（`plan_candidates`），`app/ingestion/mineru.py` / `app/ingestion/docling.py` 是两个独立解析服务的 HTTP 客户端，`app/ingestion/tabular.py` 做 XLSX 语义化，`app/ingestion/cache.py` 是内容寻址的解析缓存。调整路由只改 `triage.plan_candidates` 一处。旧文档解析失败后调用重试即走新解析。
+- **父子分块 / 表格两级处理**：`app/ingestion/parent_child.py`（父块打包、子块策略、表格行级与摘要），生成端展开在 `app/chat/parent_context.py`，元数据过滤表达式在 `app/retrieval/milvus_store.py:build_filter_expr`。
 - **换向量库 / 检索策略**：`app/retrieval/milvus_store.py` 是唯一直接触碰 Milvus 的地方。
 - **多租户 / 权限 / 审计 / 反馈**：所有表与集合均带 `tenant_id`；`app/chat/service.py` 的审计与反馈写入已预留，后续只需增加鉴权中间件与业务规则。
 - **LangSmith / trace**：模型 provider 与图节点中已留出埋点位；本期使用结构化日志，无需改接口即可后续接入。

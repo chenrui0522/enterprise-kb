@@ -32,8 +32,12 @@ class FakeLLM(LLMProvider):
 class FakeSearchService:
     def __init__(self, hits: list[SearchHit] | None = None) -> None:
         self.hits = hits or []
+        self.filters: list[dict | None] = []
 
-    async def search(self, query: str, tenant_id: str) -> list[SearchHit]:
+    async def search(
+        self, query: str, tenant_id: str, filters: dict | None = None
+    ) -> list[SearchHit]:
+        self.filters.append(filters)
         return self.hits
 
 

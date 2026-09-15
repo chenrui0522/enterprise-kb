@@ -17,6 +17,8 @@ logger = get_logger("retrieval.milvus")
 
 STRUCTURE_FIELDS = [
     "chunk_type",
+    "chunk_kind",
+    "doc_type",
     "heading_path",
     "clause_no",
     "step_no",
@@ -24,10 +26,14 @@ STRUCTURE_FIELDS = [
     "table_id",
     "row_start",
     "row_end",
+    "row_index",
     "parent_id",
     "chunker_version",
     "image_id",
 ]
+
+#: Chunk kinds that answer from their own text instead of a parent context.
+SELF_CONTAINED_KINDS = ("table_row", "table_summary", "image")
 
 
 class MilvusStore:
@@ -65,6 +71,8 @@ class MilvusStore:
         schema.add_field(field_name="section", datatype=DataType.VARCHAR, max_length=500)
         schema.add_field(field_name="tenant_id", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="chunk_type", datatype=DataType.VARCHAR, max_length=32)
+        schema.add_field(field_name="chunk_kind", datatype=DataType.VARCHAR, max_length=32)
+        schema.add_field(field_name="doc_type", datatype=DataType.VARCHAR, max_length=16)
         schema.add_field(field_name="heading_path", datatype=DataType.VARCHAR, max_length=1000)
         schema.add_field(field_name="clause_no", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="step_no", datatype=DataType.VARCHAR, max_length=64)
@@ -72,6 +80,7 @@ class MilvusStore:
         schema.add_field(field_name="table_id", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="row_start", datatype=DataType.INT64)
         schema.add_field(field_name="row_end", datatype=DataType.INT64)
+        schema.add_field(field_name="row_index", datatype=DataType.INT64)
         schema.add_field(field_name="parent_id", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="chunker_version", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="image_id", datatype=DataType.VARCHAR, max_length=64)
@@ -121,6 +130,8 @@ class MilvusStore:
                 row.update(
                     {
                         "chunk_type": chunk.chunk_type,
+                        "chunk_kind": chunk.chunk_kind,
+                        "doc_type": chunk.doc_type,
                         "heading_path": chunk.heading_path,
                         "clause_no": chunk.clause_no,
                         "step_no": chunk.step_no,
@@ -128,6 +139,7 @@ class MilvusStore:
                         "table_id": chunk.table_id,
                         "row_start": chunk.row_start,
                         "row_end": chunk.row_end,
+                        "row_index": chunk.row_index,
                         "parent_id": chunk.parent_id,
                         "chunker_version": chunk.chunker_version,
                         "image_id": chunk.image_id,
@@ -144,10 +156,23 @@ class MilvusStore:
             return
         self._client.delete(self._collection, filter=f'version_id == "{version_id}"')
 
-    def hybrid_search(self, query: str, query_vector: list[float], tenant_id: str, top_n: int) -> list[dict]:
-        """Hybrid dense + BM25 search scoped to a tenant."""
+    def hybrid_search(
+        self,
+        query: str,
+        query_vector: list[float],
+        tenant_id: str,
+        top_n: int,
+        filters: dict | None = None,
+    ) -> list[dict]:
+        """Hybrid dense + BM25 search scoped to a tenant.
+
+        Metadata (doc_type, heading prefix, table/image id, ...) is applied as
+        an `expr` filter on **both** requests. Filtering is deliberately not a
+        third ranked route: matching a filter is not relevance, and mixing it
+        into RRF would rank "符合条件" as if it were "相关".
+        """
         self.ensure_collection()
-        expr = f'tenant_id == "{tenant_id}"'
+        expr = build_filter_expr(tenant_id, filters)
         dense_req = AnnSearchRequest(
             data=[query_vector],
             anns_field="dense",
@@ -196,6 +221,58 @@ class MilvusStore:
         return self._structure_fields_supported
 
 
+#: Fields a caller may filter on. Everything here is a scalar column in the
+#: unified chunk schema, so filtering never needs a second index.
+FILTERABLE_FIELDS = frozenset(
+    {
+        "doc_type",
+        "chunk_kind",
+        "chunk_type",
+        "doc_id",
+        "version_id",
+        "table_id",
+        "image_id",
+        "parent_id",
+        "heading_path",
+        "page",
+        "row_index",
+        "tenant_id",
+    }
+)
+INT_FILTER_FIELDS = frozenset({"page", "row_index"})
+
+
+def build_filter_expr(tenant_id: str, filters: dict | None = None) -> str:
+    """Compose the Milvus `expr` for a tenant-scoped search plus metadata filters."""
+    clauses = [f'tenant_id == "{_escape_literal(tenant_id)}"']
+    for field, value in (filters or {}).items():
+        if field not in FILTERABLE_FIELDS or field == "tenant_id":
+            continue
+        if value is None or value == "" or value == []:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            items = [item for item in value if item not in (None, "")]
+            if not items:
+                continue
+            joined = ", ".join(_filter_literal(field, item) for item in items)
+            clauses.append(f"{field} in [{joined}]")
+        elif field == "heading_path":
+            clauses.append(f'{field} like "{_escape_literal(value)}%"')
+        else:
+            clauses.append(f"{field} == {_filter_literal(field, value)}")
+    return " and ".join(clauses)
+
+
+def _filter_literal(field: str, value) -> str:
+    if field in INT_FILTER_FIELDS:
+        return str(int(value))
+    return f'"{_escape_literal(value)}"'
+
+
+def _escape_literal(value) -> str:
+    return str(value).replace("\\", "").replace('"', "")
+
+
 def _hit_to_dict(hit) -> dict:
     entity = dict(hit.get("entity") or {})
     return {
@@ -208,6 +285,8 @@ def _hit_to_dict(hit) -> dict:
         "section": entity.get("section", ""),
         "score": float(hit.get("distance") or 0.0),
         "chunk_type": entity.get("chunk_type", "") or "text",
+        "chunk_kind": entity.get("chunk_kind", "") or "child",
+        "doc_type": entity.get("doc_type", "") or "",
         "heading_path": entity.get("heading_path", "") or "",
         "clause_no": entity.get("clause_no", "") or "",
         "step_no": entity.get("step_no", "") or "",
@@ -215,6 +294,7 @@ def _hit_to_dict(hit) -> dict:
         "table_id": entity.get("table_id", "") or "",
         "row_start": int(entity.get("row_start") or 0),
         "row_end": int(entity.get("row_end") or 0),
+        "row_index": int(entity.get("row_index") or 0),
         "parent_id": entity.get("parent_id", "") or "",
         "chunker_version": entity.get("chunker_version", "") or "",
         "image_id": entity.get("image_id", "") or "",

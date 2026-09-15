@@ -169,6 +169,8 @@ async def _wait_for_completion(session_factory, version_ids: list[str], timeout:
                     results[version_id] = {
                         "status": version.status,
                         "chunks": version.chunk_count,
+                        "parents": version.parent_count or 0,
+                        "tables": version.table_count or 0,
                         "chunker_version": version.chunker_version or "",
                         "error": version.error_message or "",
                     }
@@ -177,6 +179,8 @@ async def _wait_for_completion(session_factory, version_ids: list[str], timeout:
         results[version_id] = {
             "status": "timeout",
             "chunks": 0,
+            "parents": 0,
+            "tables": 0,
             "chunker_version": "",
             "error": "reindex wait timed out",
         }
@@ -203,6 +207,7 @@ def format_summary(summary: dict) -> str:
     for version_id, result in (summary.get("results") or {}).items():
         lines.append(
             f"  [{result['status']}] {version_id} chunks={result['chunks']} "
+            f"parents={result.get('parents', 0)} tables={result.get('tables', 0)} "
             f"chunker={result['chunker_version']} {result['error']}".rstrip()
         )
     return "\n".join(lines)

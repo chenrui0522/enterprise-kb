@@ -23,6 +23,10 @@ class ChunkDraft(BaseModel):
     table_id: str = ""
     row_start: int = 0
     row_end: int = 0
+    row_index: int = 0
     parent_id: str = ""
     chunker_version: str = ""
     image_id: str = ""
+    #: child | table_row | table_summary | image
+    chunk_kind: str = "child"
+    doc_type: str = ""

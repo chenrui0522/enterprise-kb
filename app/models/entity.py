@@ -60,6 +60,69 @@ class DocumentVersion(Base, TimestampMixin):
         String(64), nullable=False, default="", server_default=""
     )
     conversion_report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    parent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    table_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+
+class ChunkParent(Base, TimestampMixin):
+    """Parent chunk (heading subtree) used as generation context, not retrieval.
+
+    Milvus only indexes child/table/image chunks; the full parent text lives
+    here so the answer node can expand a retrieved child by `parent_id`.
+    """
+
+    __tablename__ = "chunk_parents"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    doc_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    heading_path: Mapped[str] = mapped_column(
+        String(1000), nullable=False, default="", server_default=""
+    )
+    section: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="")
+    page: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    doc_type: Mapped[str] = mapped_column(String(16), nullable=False, default="", server_default="")
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    char_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    child_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chunker_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
+
+
+class DocumentTable(Base, TimestampMixin):
+    """One table/sheet of a document version; the grid itself lives in object storage."""
+
+    __tablename__ = "document_tables"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    doc_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="")
+    page: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    section: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="")
+    heading_path: Mapped[str] = mapped_column(
+        String(1000), nullable=False, default="", server_default=""
+    )
+    header: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    storage_key: Mapped[str] = mapped_column(String(1000), nullable=False, default="", server_default="")
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    chunker_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
 
 
 class Conversation(Base, TimestampMixin):

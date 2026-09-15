@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -17,7 +18,7 @@ from app.ingestion.doc_types import normalize_doc_type
 from app.ingestion.queue import enqueue_job, make_job
 from app.ingestion.storage import FileDocumentStorage
 from app.ingestion.converters import IMAGE_EXTENSIONS
-from app.models.entity import Document, DocumentImage, DocumentVersion
+from app.models.entity import Document, DocumentImage, DocumentTable, DocumentVersion
 from app.schemas.documents import DocumentOut, DocumentUploadOut
 from app.chat.service import write_audit
 
@@ -250,6 +251,70 @@ async def retry_document(
         resource_id=document.id,
     )
     return {"id": document.id, "status": document.status, "stage": document.stage}
+
+@router.get("/documents/{document_id}/tables")
+async def document_tables(
+    document_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_dependency),
+) -> list[dict]:
+    """List the tables stored for one document (metadata only)."""
+    document = await session.get(Document, document_id)
+    if document is None or document.tenant_id != tenant_id:
+        raise NotFoundError("文档不存在")
+    result = await session.execute(
+        select(DocumentTable)
+        .where(DocumentTable.doc_id == document_id, DocumentTable.tenant_id == tenant_id)
+        .order_by(DocumentTable.created_at)
+        .limit(200)
+    )
+    return [
+        {
+            "table_id": table.id,
+            "name": table.name,
+            "page": table.page,
+            "section": table.section,
+            "header": list(table.header or []),
+            "row_count": table.row_count,
+            "summary": table.summary or "",
+            "url": f"/api/v1/documents/{document_id}/tables/{table.id}",
+        }
+        for table in result.scalars()
+    ]
+
+
+@router.get("/documents/{document_id}/tables/{table_id}")
+async def document_table(
+    document_id: str,
+    table_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_dependency),
+) -> dict:
+    """Return one stored table grid by id (rows come from object storage)."""
+    table = await session.get(DocumentTable, table_id)
+    if table is None or table.tenant_id != tenant_id or table.doc_id != document_id:
+        raise NotFoundError("表格不存在")
+    settings = get_settings()
+    payload: dict = {
+        "table_id": table.id,
+        "name": table.name,
+        "page": table.page,
+        "section": table.section,
+        "heading_path": table.heading_path,
+        "header": list(table.header or []),
+        "row_count": table.row_count,
+        "summary": table.summary or "",
+        "source": table.source,
+        "rows": [],
+    }
+    if table.storage_key:
+        try:
+            path = FileDocumentStorage(settings.document_storage_dir).resolve(table.storage_key)
+            payload["rows"] = json.loads(path.read_text(encoding="utf-8")).get("rows", [])
+        except Exception:
+            logger.warning("Could not read table asset %s", table.storage_key, exc_info=True)
+    return payload
+
 
 @router.get("/documents/{document_id}/images")
 async def document_images(

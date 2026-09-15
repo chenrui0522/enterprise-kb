@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -11,7 +12,12 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.ingestion.cache import ParseCache
-from app.ingestion.chunker import ChunkContext, DEFAULT_CHUNKER_VERSION, chunk_structure
+from app.ingestion.chunker import (
+    ChunkContext,
+    DEFAULT_CHUNKER_VERSION,
+    chunk_structure,
+    detect_doc_type,
+)
 from app.ingestion.docling import docling_available
 from app.ingestion.images import dedupe_assets, extract_images_local, filter_decorative
 from app.ingestion.structure import BLOCK_IMAGE, Block, structure_from_markdown
@@ -22,9 +28,15 @@ from app.ingestion.converters import (
     NoExtractableContentError,
 )
 from app.ingestion.models import ChunkDraft
+from app.ingestion.parent_child import (
+    PARENT_CHILD_VERSION,
+    ChunkPlan,
+    build_chunk_plan,
+    params_for,
+)
 from app.ingestion.storage import FileDocumentStorage
 from app.ingestion.triage import TriageResult, plan_candidates, triage_file
-from app.models.entity import Document, DocumentImage, DocumentVersion
+from app.models.entity import ChunkParent, Document, DocumentImage, DocumentTable, DocumentVersion
 from app.providers.base import Embedder
 from app.retrieval.chunk import ChunkRecord
 from app.retrieval.milvus_store import MilvusStore
@@ -105,11 +117,12 @@ class IngestionPipeline:
         doc_type: str | None = None,
         chunker_version: str | None = None,
     ) -> None:
+        settings = self._settings or get_settings()
         file_path = self._storage.resolve(job["storage_key"])
         if job.get("reindex"):
             self._store.delete_by_version(version.id)
             self._storage.delete_version_assets(document.id, version.id)
-            await session.execute(delete(DocumentImage).where(DocumentImage.version_id == version.id))
+            await self._delete_version_rows(session, version.id)
 
         await self._set_stage(session, document, version, "parsing")
         started = time.perf_counter()
@@ -189,16 +202,33 @@ class IngestionPipeline:
         structure.blocks = [block for block in structure.blocks if block.type != BLOCK_IMAGE]
         if image_blocks:
             structure.blocks.extend(image_blocks)
-        drafts = chunk_structure(
-            structure,
-            context,
-            doc_type=resolved_doc_type,
-            chunk_size=chunk_size,
-            overlap=overlap,
-            chunker_version=chunker_version or DEFAULT_CHUNKER_VERSION,
-        )
+        resolved_version = chunker_version or DEFAULT_CHUNKER_VERSION
+        plan: ChunkPlan | None = None
+        if self._uses_parent_child(resolved_version):
+            # v2 chunks by document type, so an "auto" upload is classified here
+            # (and persisted) instead of inside the legacy chunker.
+            resolved_doc_type = resolved_doc_type or detect_doc_type(structure)
+            plan = build_chunk_plan(
+                structure,
+                context,
+                doc_type=resolved_doc_type,
+                params=params_for(resolved_doc_type, settings),
+                tables=list(converted.tables or []),
+                chunker_version=PARENT_CHILD_VERSION,
+            )
+            drafts = plan.children
+        else:
+            drafts = chunk_structure(
+                structure,
+                context,
+                doc_type=resolved_doc_type,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                chunker_version=resolved_version,
+            )
         if not drafts:
             raise ValueError("切分后没有生成任何片段")
+        version.chunker_version = drafts[0].chunker_version if drafts else ""
 
         await self._set_stage(session, document, version, "embedding")
         chunks = await self._embed_drafts(drafts, context)
@@ -208,11 +238,21 @@ class IngestionPipeline:
         old_version_id = document.current_version_id
 
         conversion_meta["images"] = len(image_blocks)
-        conversion_meta["table_files"] = self._store_tables(document, version, converted)
+        if plan is not None:
+            await self._store_parents(session, document, version, plan)
+            conversion_meta["table_files"] = await self._store_tables(
+                session, document, version, plan
+            )
+            conversion_meta["parents"] = len(plan.parents)
+            conversion_meta["tables"] = len(plan.tables)
+            conversion_meta["table_sheets"] = [table.name for table in plan.tables][:20]
+            version.parent_count = len(plan.parents)
+            version.table_count = len(plan.tables)
+        else:
+            conversion_meta["table_files"] = self._store_converted_tables(document, version, converted)
         version.conversion_report = conversion_meta
         if resolved_doc_type:
             version.doc_type = resolved_doc_type
-        version.chunker_version = drafts[0].chunker_version if drafts else ""
         version.status = "ready"
         version.stage = "ready"
         version.chunk_count = inserted
@@ -234,7 +274,7 @@ class IngestionPipeline:
         if old_version_id and old_version_id != version.id:
             await asyncio.to_thread(self._store.delete_by_version, old_version_id)
             self._storage.delete_version_assets(document.id, old_version_id)
-            await session.execute(delete(DocumentImage).where(DocumentImage.version_id == old_version_id))
+            await self._delete_version_rows(session, old_version_id)
             await session.commit()
 
     async def _convert_to_markdown(
@@ -362,9 +402,80 @@ class IngestionPipeline:
             "ocr_pages": list(getattr(converted, "ocr_pages", None) or []),
         }
 
-    def _store_tables(
+    @staticmethod
+    def _uses_parent_child(chunker_version: str) -> bool:
+        return str(chunker_version or "").startswith(PARENT_CHILD_VERSION)
+
+    async def _store_parents(
+        self,
+        session: AsyncSession,
+        document: Document,
+        version: DocumentVersion,
+        plan: ChunkPlan,
+    ) -> None:
+        """Persist parent chunks (generation context) in PostgreSQL."""
+        for parent in plan.parents:
+            session.add(
+                ChunkParent(
+                    **parent.as_row(
+                        tenant_id=document.tenant_id,
+                        doc_id=document.id,
+                        version_id=version.id,
+                    )
+                )
+            )
+        if plan.parents:
+            await session.flush()
+            logger.info("Stored %d parent chunk(s) for version=%s", len(plan.parents), version.id)
+
+    async def _store_tables(
+        self,
+        session: AsyncSession,
+        document: Document,
+        version: DocumentVersion,
+        plan: ChunkPlan,
+    ) -> list[str]:
+        """Write each table grid to storage and register it in `document_tables`."""
+        keys: list[str] = []
+        for index, table in enumerate(plan.tables):
+            name = f"{index:03d}-{table.name or 'table'}"
+            payload = json.dumps(
+                {
+                    "id": table.id,
+                    "name": table.name,
+                    "header": table.header,
+                    "rows": table.rows,
+                    "summary": table.summary,
+                    "source": table.source,
+                    "page": table.page,
+                    "section": table.section,
+                    "heading_path": table.heading_path,
+                },
+                ensure_ascii=False,
+            )
+            storage_key = ""
+            try:
+                storage_key = self._storage.store_table(document.id, version.id, name, payload)
+                keys.append(storage_key)
+            except Exception:
+                logger.warning("Could not store table %s", name, exc_info=True)
+            row = table.as_row(
+                tenant_id=document.tenant_id,
+                doc_id=document.id,
+                version_id=version.id,
+                chunker_version=version.chunker_version or "",
+            )
+            row["storage_key"] = storage_key
+            session.add(DocumentTable(**row))
+        if plan.tables:
+            await session.flush()
+            logger.info("Stored %d table asset(s) for version=%s", len(plan.tables), version.id)
+        return keys
+
+    def _store_converted_tables(
         self, document: Document, version: DocumentVersion, converted: ConversionResult
     ) -> list[str]:
+        """Legacy (`structure-v1`) path: cache converter table grids as files only."""
         keys: list[str] = []
         for index, table in enumerate(getattr(converted, "tables", None) or []):
             name = f"{index:03d}-{table.sheet or 'sheet'}"
@@ -378,6 +489,13 @@ class IngestionPipeline:
             except Exception:
                 logger.warning("Could not store table %s", name, exc_info=True)
         return keys
+
+    @staticmethod
+    async def _delete_version_rows(session: AsyncSession, version_id: str) -> None:
+        """Drop every derived row of one version (images, parents, tables)."""
+        await session.execute(delete(DocumentImage).where(DocumentImage.version_id == version_id))
+        await session.execute(delete(ChunkParent).where(ChunkParent.version_id == version_id))
+        await session.execute(delete(DocumentTable).where(DocumentTable.version_id == version_id))
 
     @staticmethod
     def _plan_converters(
@@ -423,9 +541,12 @@ class IngestionPipeline:
                         table_id=draft.table_id,
                         row_start=draft.row_start,
                         row_end=draft.row_end,
+                        row_index=draft.row_index,
                         parent_id=draft.parent_id,
                         chunker_version=draft.chunker_version,
                         image_id=draft.image_id,
+                        chunk_kind=draft.chunk_kind,
+                        doc_type=draft.doc_type,
                     )
                 )
             done = min(start + batch_size, total)

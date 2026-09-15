@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.chat.graph import ChatGraph
+from app.chat.parent_context import build_parent_expander
 from app.core.config import get_settings
 from app.core.db import create_tables_if_needed, dispose_engine
 from app.core.errors import AppError
@@ -69,7 +70,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.milvus_store = store
     app.state.search_service = search_service
     app.state.chat_graph = ChatGraph(
-        llm, search_service, history_turns=settings.history_turns, checkpointer=checkpointer
+        llm,
+        search_service,
+        history_turns=settings.history_turns,
+        checkpointer=checkpointer,
+        parent_expander=build_parent_expander(get_session_factory(), settings),
     )
     app.state.checkpointer = checkpointer
     app.state.checkpointer_cm = checkpointer_cm
