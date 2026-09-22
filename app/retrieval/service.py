@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 
 from redis.asyncio import Redis
 
 from app.core.config import Settings
-from app.core.logging import get_logger
+from app.core.logging import get_logger, log_event
 from app.providers.base import Embedder, Reranker
 from app.retrieval.chunk import SearchHit
 from app.retrieval.milvus_store import MilvusStore
@@ -34,31 +35,59 @@ class SearchService:
         self._rerank_semaphore = asyncio.Semaphore(settings.rerank_max_concurrency)
 
     async def search(
-        self, query: str, tenant_id: str, filters: dict | None = None
+        self,
+        query: str,
+        tenant_id: str,
+        filters: dict | None = None,
+        principal=None,
     ) -> list[SearchHit]:
         """Hybrid search (dense + BM25 -> RRF) with optional metadata filters.
 
         `filters` narrows both routes through a Milvus `expr`; it never adds a
         ranked route, so the fusion semantics stay unchanged.
         """
+        from app.identity.visibility import build_visibility_expr
+
         top_n = self._settings.retrieval_top_n
         top_k = self._settings.retrieval_top_k
-        cache_key = self._cache_key(query, tenant_id, top_n, top_k, filters)
+        visibility_expr = build_visibility_expr(principal) if principal is not None else None
+        cache_key = self._cache_key(
+            query, tenant_id, top_n, top_k, filters, principal=principal
+        )
         cached = await self._redis.get(cache_key)
         if cached:
             try:
                 return [SearchHit.model_validate(item) for item in json.loads(cached)]
             except Exception:
-                logger.warning("Ignored corrupted retrieval cache entry")
+                log_event(
+                    logger,
+                    "Ignored corrupted retrieval cache entry",
+                    level=logging.WARNING,
+                    event="retrieval.cache_corrupt",
+                    ok=False,
+                )
 
         query_vector = (await self._embedder.embed([query]))[0]
-        candidates = self._store.hybrid_search(query, query_vector, tenant_id, top_n, filters)
+        candidates = self._store.hybrid_search(
+            query,
+            query_vector,
+            tenant_id,
+            top_n,
+            filters,
+            visibility_expr=visibility_expr,
+        )
         hits = await self._rank(query, candidates, top_k)
         try:
             payload = json.dumps([hit.model_dump() for hit in hits], ensure_ascii=False)
             await self._redis.set(cache_key, payload, ex=self._settings.retrieval_cache_ttl)
         except Exception:
-            logger.warning("Failed to write retrieval cache")
+            log_event(
+                logger,
+                "Failed to write retrieval cache",
+                level=logging.WARNING,
+                event="retrieval.cache_write_failed",
+                ok=False,
+            )
         return hits
 
     async def _rank(self, query: str, candidates: list[dict], top_k: int) -> list[SearchHit]:
@@ -84,10 +113,23 @@ class SearchService:
         top_n: int,
         top_k: int,
         filters: dict | None = None,
+        principal=None,
     ) -> str:
         filter_key = json.dumps(filters or {}, sort_keys=True, ensure_ascii=False)
+        scope = ""
+        if principal is not None:
+            scope = json.dumps(
+                {
+                    "org": list(principal.org_unit_ids),
+                    "domains": list(principal.domains),
+                    "projects": list(principal.project_ids),
+                    "clearance": principal.clearance,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
         digest = hashlib.sha1(
-            f"{tenant_id}|{query}|{top_n}|{top_k}|{filter_key}".encode("utf-8")
+            f"{tenant_id}|{query}|{top_n}|{top_k}|{filter_key}|{scope}".encode("utf-8")
         ).hexdigest()
         return f"kb:retrieval:{digest}"
 

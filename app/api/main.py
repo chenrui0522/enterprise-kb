@@ -15,11 +15,12 @@ from app.core.config import get_settings
 from app.core.db import create_tables_if_needed, dispose_engine, get_session_factory
 from app.core.errors import AppError
 from app.core.logging import get_logger, setup_logging
+from app.core.middleware import RequestContextMiddleware
 from app.core.redis import close_redis, get_redis
 from app.providers.factory import build_embedder, build_llm, build_reranker
 from app.retrieval.milvus_store import MilvusStore
 from app.retrieval.service import SearchService
-from app.api.routers import chat, documents, system
+from app.api.routers import auth, chat, documents, org, system
 
 logger = get_logger("api")
 
@@ -105,13 +106,18 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
     )
+    # Innermost relative to CORS: runs after CORS has accepted the request.
+    app.add_middleware(RequestContextMiddleware)
 
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
     app.include_router(system.router)
+    app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(org.router, prefix="/api/v1")
     app.include_router(chat.router, prefix="/api/v1")
     app.include_router(documents.router, prefix="/api/v1")
     return app

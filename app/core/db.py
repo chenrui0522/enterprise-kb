@@ -56,6 +56,7 @@ async def create_tables_if_needed() -> None:
     if not settings.auto_create_tables:
         return
     import app.models.entity  # noqa: F401
+    import app.models.identity  # noqa: F401
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

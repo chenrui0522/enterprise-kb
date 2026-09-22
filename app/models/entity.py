@@ -34,6 +34,13 @@ class Document(Base, TimestampMixin):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     current_version_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Access-control labels (authoritative on versions; mirrored here for list filters).
+    org_unit_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    domain: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    classification: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="general", server_default="general"
+    )
 
 
 class DocumentVersion(Base, TimestampMixin):
@@ -62,6 +69,12 @@ class DocumentVersion(Base, TimestampMixin):
     conversion_report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     parent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     table_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    org_unit_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    domain: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    classification: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="general", server_default="general"
+    )
 
 
 class ChunkParent(Base, TimestampMixin):

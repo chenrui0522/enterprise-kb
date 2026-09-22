@@ -22,10 +22,12 @@ from app.chat.service import (
 )
 from app.core.db import get_db_session, get_session_factory
 from app.core.errors import AppError
-from app.core.logging import get_logger
+from app.core.logging import bind_context, get_log_context, get_logger, log_event, logging_context, preview_text
 from app.core.ratelimit import check_rate_limit
 from app.core.redis import get_redis
-from app.core.tenant import tenant_dependency
+from app.identity.constants import PERM_CHAT_USE
+from app.identity.deps import require_permission, tenant_from_principal
+from app.identity.principal import Principal
 from app.models.entity import DocumentImage, DocumentTable, Message
 from app.schemas.chat import (
     ChatRequest,
@@ -180,10 +182,14 @@ async def _load_citation_images(
 async def create_conversation_endpoint(
     payload: ConversationCreate | None = None,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
 ) -> ConversationOut:
     conversation = await create_conversation(
-        session, tenant_id, title=payload.title if payload else None
+        session,
+        tenant_id,
+        title=payload.title if payload else None,
+        created_by=principal.user_id,
     )
     return ConversationOut.model_validate(conversation)
 
@@ -191,9 +197,10 @@ async def create_conversation_endpoint(
 @router.get("/conversations", response_model=list[ConversationOut])
 async def conversations_endpoint(
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
 ) -> list[ConversationOut]:
-    conversations = await list_conversations(session, tenant_id)
+    conversations = await list_conversations(session, tenant_id, created_by=principal.user_id)
     return [ConversationOut.model_validate(item) for item in conversations]
 
 
@@ -201,7 +208,8 @@ async def conversations_endpoint(
 async def messages_endpoint(
     conversation_id: str,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
 ) -> list[MessageOut]:
     rows = await list_messages(session, tenant_id, conversation_id)
     image_map = await _load_citation_images(
@@ -238,7 +246,8 @@ async def messages_endpoint(
 async def chat_stream(
     payload: ChatRequest,
     request: Request,
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
 ) -> StreamingResponse:
     redis = get_redis()
     client_key = request.client.host if request.client else "unknown"
@@ -246,8 +255,15 @@ async def chat_stream(
     if not allowed:
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
     graph: ChatGraph = request.app.state.chat_graph
+    bind_context(
+        tenant_id=tenant_id,
+        user_id=principal.user_id,
+        conversation_id=payload.conversation_id,
+    )
+    # StreamingResponse body runs after middleware clears contextvars; snapshot now.
+    log_ctx = get_log_context()
     return StreamingResponse(
-        _chat_event_stream(graph, payload, tenant_id),
+        _chat_event_stream(graph, payload, tenant_id, principal, log_ctx=log_ctx),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -257,18 +273,43 @@ async def chat_stream(
     )
 
 
-async def _chat_event_stream(graph: ChatGraph, payload: ChatRequest, tenant_id: str) -> AsyncIterator[str]:
+async def _chat_event_stream(
+    graph: ChatGraph,
+    payload: ChatRequest,
+    tenant_id: str,
+    principal: Principal,
+    *,
+    log_ctx: dict | None = None,
+) -> AsyncIterator[str]:
+    with logging_context(**(log_ctx or {})):
+        async for chunk in _chat_event_stream_inner(graph, payload, tenant_id, principal):
+            yield chunk
+
+
+async def _chat_event_stream_inner(
+    graph: ChatGraph, payload: ChatRequest, tenant_id: str, principal: Principal
+) -> AsyncIterator[str]:
     session_factory = get_session_factory()
     try:
         # Phase 1: short-lived session for conversation + user message.
         async with session_factory() as session:
             if payload.conversation_id:
-                conversation = await get_conversation(session, tenant_id, payload.conversation_id)
+                conversation = await get_conversation(
+                    session, tenant_id, payload.conversation_id, created_by=principal.user_id
+                )
             else:
                 conversation = await create_conversation(
-                    session, tenant_id, title=payload.message[:30]
+                    session, tenant_id, title=payload.message[:30],
+                    created_by=principal.user_id,
                 )
             conversation_id = conversation.id
+            bind_context(conversation_id=conversation_id)
+            log_event(
+                logger,
+                "chat start",
+                event="chat.start",
+                query_preview=preview_text(payload.message),
+            )
             yield sse_event({"event": "message_start", "data": {"conversation_id": conversation_id}})
 
             rows = await list_messages(session, tenant_id, conversation_id)
@@ -283,6 +324,17 @@ async def _chat_event_stream(graph: ChatGraph, payload: ChatRequest, tenant_id: 
             "tenant_id": tenant_id,
             "user_question": payload.message,
             "history": history + [{"role": "user", "content": payload.message}],
+            "principal_scope": {
+                "user_id": principal.user_id,
+                "username": principal.username,
+                "display_name": principal.display_name,
+                "site": principal.site,
+                "clearance": principal.clearance,
+                "org_unit_ids": list(principal.org_unit_ids),
+                "domains": list(principal.domains),
+                "project_ids": list(principal.project_ids),
+                "permissions": list(principal.permissions),
+            },
         }
 
         error_detail: str | None = None
@@ -338,6 +390,7 @@ async def _chat_event_stream(graph: ChatGraph, payload: ChatRequest, tenant_id: 
                 resource_type="conversation",
                 resource_id=conversation_id,
                 detail={"user_message_id": user_message.id, "assistant_message_id": assistant_message.id},
+                actor=principal.username,
             )
         async with session_factory() as session:
             await _attach_citation_images(session, tenant_id, citations)
@@ -355,6 +408,14 @@ async def _chat_event_stream(graph: ChatGraph, payload: ChatRequest, tenant_id: 
                 },
             }
         )
+        log_event(
+            logger,
+            "chat done",
+            event="chat.done",
+            ok=error_detail is None,
+            citation_count=len(citations),
+            refused=bool(values.get("refused")),
+        )
     except AppError as exc:
         yield sse_event({"event": "error", "data": exc.message})
 
@@ -363,7 +424,8 @@ async def _chat_event_stream(graph: ChatGraph, payload: ChatRequest, tenant_id: 
 async def submit_feedback(
     payload: FeedbackIn,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
 ) -> dict:
     feedback = await save_feedback(session, tenant_id, payload.message_id, payload.rating, payload.comment)
     return {"id": feedback.id, "message_id": feedback.message_id, "rating": feedback.rating}

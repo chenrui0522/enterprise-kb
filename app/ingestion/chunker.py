@@ -23,6 +23,10 @@ class ChunkContext:
     version_id: str
     tenant_id: str
     title: str
+    org_unit_id: str = ""
+    project_id: str = ""
+    domain: str = ""
+    classification: str = "general"
 
 
 _SENTENCE_END = re.compile(r"[。！？!?；;]$")

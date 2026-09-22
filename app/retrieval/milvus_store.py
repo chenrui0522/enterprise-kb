@@ -32,6 +32,13 @@ STRUCTURE_FIELDS = [
     "image_id",
 ]
 
+ACCESS_FIELDS = [
+    "org_unit_id",
+    "project_id",
+    "domain",
+    "classification",
+]
+
 #: Chunk kinds that answer from their own text instead of a parent context.
 SELF_CONTAINED_KINDS = ("table_row", "table_summary", "image")
 
@@ -45,6 +52,7 @@ class MilvusStore:
         self._collection = settings.milvus_collection
         self._ready = False
         self._structure_fields_supported: bool | None = None
+        self._access_fields_supported: bool | None = None
 
     def ensure_collection(self) -> None:
         if self._ready:
@@ -84,6 +92,10 @@ class MilvusStore:
         schema.add_field(field_name="parent_id", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="chunker_version", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="image_id", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="org_unit_id", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="project_id", datatype=DataType.VARCHAR, max_length=64)
+        schema.add_field(field_name="domain", datatype=DataType.VARCHAR, max_length=32)
+        schema.add_field(field_name="classification", datatype=DataType.VARCHAR, max_length=16)
         schema.add_field(field_name="dense", datatype=DataType.FLOAT_VECTOR, dim=settings.milvus_vector_dim)
         schema.add_field(field_name="sparse", datatype=DataType.SPARSE_FLOAT_VECTOR)
         schema.add_function(
@@ -145,6 +157,15 @@ class MilvusStore:
                         "image_id": chunk.image_id,
                     }
                 )
+            if self._supports_access_fields():
+                row.update(
+                    {
+                        "org_unit_id": chunk.org_unit_id or "",
+                        "project_id": chunk.project_id or "",
+                        "domain": chunk.domain or "",
+                        "classification": chunk.classification or "general",
+                    }
+                )
             rows.append(row)
         if not rows:
             return 0
@@ -163,6 +184,7 @@ class MilvusStore:
         tenant_id: str,
         top_n: int,
         filters: dict | None = None,
+        visibility_expr: str | None = None,
     ) -> list[dict]:
         """Hybrid dense + BM25 search scoped to a tenant.
 
@@ -172,7 +194,7 @@ class MilvusStore:
         into RRF would rank "符合条件" as if it were "相关".
         """
         self.ensure_collection()
-        expr = build_filter_expr(tenant_id, filters)
+        expr = build_filter_expr(tenant_id, filters, visibility_expr=visibility_expr)
         dense_req = AnnSearchRequest(
             data=[query_vector],
             anns_field="dense",
@@ -209,6 +231,8 @@ class MilvusStore:
             self._client.drop_collection(self._collection)
         self._ready = False
         self._structure_fields_supported = None
+        self._access_fields_supported = None
+
     def _supports_structure_fields(self) -> bool:
         if self._structure_fields_supported is not None:
             return self._structure_fields_supported
@@ -219,6 +243,17 @@ class MilvusStore:
         except Exception:
             self._structure_fields_supported = False
         return self._structure_fields_supported
+
+    def _supports_access_fields(self) -> bool:
+        if self._access_fields_supported is not None:
+            return self._access_fields_supported
+        try:
+            description = self._client.describe_collection(self._collection)
+            names = {field.get("name") for field in description.get("fields", [])}
+            self._access_fields_supported = all(field in names for field in ACCESS_FIELDS)
+        except Exception:
+            self._access_fields_supported = False
+        return self._access_fields_supported
 
 
 #: Fields a caller may filter on. Everything here is a scalar column in the
@@ -237,12 +272,21 @@ FILTERABLE_FIELDS = frozenset(
         "page",
         "row_index",
         "tenant_id",
+        "org_unit_id",
+        "project_id",
+        "domain",
+        "classification",
     }
 )
 INT_FILTER_FIELDS = frozenset({"page", "row_index"})
 
 
-def build_filter_expr(tenant_id: str, filters: dict | None = None) -> str:
+def build_filter_expr(
+    tenant_id: str,
+    filters: dict | None = None,
+    *,
+    visibility_expr: str | None = None,
+) -> str:
     """Compose the Milvus `expr` for a tenant-scoped search plus metadata filters."""
     clauses = [f'tenant_id == "{_escape_literal(tenant_id)}"']
     for field, value in (filters or {}).items():
@@ -260,6 +304,8 @@ def build_filter_expr(tenant_id: str, filters: dict | None = None) -> str:
             clauses.append(f'{field} like "{_escape_literal(value)}%"')
         else:
             clauses.append(f"{field} == {_filter_literal(field, value)}")
+    if visibility_expr:
+        clauses.append(f"({visibility_expr})")
     return " and ".join(clauses)
 
 

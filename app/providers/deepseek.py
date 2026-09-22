@@ -23,15 +23,28 @@ class DeepSeekProvider(LLMProvider):
         )
         self._model = settings.llm_model
         self._temperature = settings.llm_temperature
+        # RAG path keeps thinking off by default (cheaper, grounded answers).
+        self._thinking = {
+            "type": "enabled" if settings.llm_thinking_enabled else "disabled",
+        }
+
+    def _create_kwargs(self, *, temperature: float | None, stream: bool = False) -> dict:
+        kwargs: dict = {
+            "model": self._model,
+            "temperature": self._temperature if temperature is None else temperature,
+            "extra_body": {"thinking": self._thinking},
+        }
+        if stream:
+            kwargs["stream"] = True
+        return kwargs
 
     async def complete(self, *, system: str, user: str, temperature: float | None = None) -> str:
         response = await self._client.chat.completions.create(
-            model=self._model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=self._temperature if temperature is None else temperature,
+            **self._create_kwargs(temperature=temperature),
         )
         return response.choices[0].message.content or ""
 
@@ -41,13 +54,12 @@ class DeepSeekProvider(LLMProvider):
             if attempt:
                 await asyncio.sleep(1.0)
             response = await self._client.chat.completions.create(
-                model=self._model,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                temperature=self._temperature if temperature is None else temperature,
                 response_format={"type": "json_object"},
+                **self._create_kwargs(temperature=temperature),
             )
             raw = response.choices[0].message.content or ""
             if not raw.strip():
@@ -55,7 +67,7 @@ class DeepSeekProvider(LLMProvider):
                 continue
             try:
                 data = json.loads(_strip_code_fence(raw))
-            except json.JSONDecodeError as exc:
+            except json.JSONDecodeError:
                 last_error = UpstreamError(f"LLM 返回了非法 JSON：{raw[:200]}")
                 continue
             if not isinstance(data, dict):
@@ -67,13 +79,11 @@ class DeepSeekProvider(LLMProvider):
 
     async def stream(self, *, system: str, user: str, temperature: float | None = None) -> AsyncIterator[str]:
         stream = await self._client.chat.completions.create(
-            model=self._model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=self._temperature if temperature is None else temperature,
-            stream=True,
+            **self._create_kwargs(temperature=temperature, stream=True),
         )
         async for chunk in stream:
             delta = chunk.choices[0].delta.content if chunk.choices else None

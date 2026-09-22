@@ -12,3 +12,7 @@ frontend/dist/
 *.log
 *.egg-info/
 .codex/
+
+# Office lock files
+~$*
+

@@ -15,6 +15,8 @@ class ChatState(TypedDict):
     # Optional metadata filter (doc_type / table_id / heading_path prefix ...);
     # applied as a Milvus expr on both retrieval routes, never as a ranked route.
     filters: dict
+    # Live Principal scope for corpus visibility (never freeze auth cookies here).
+    principal_scope: dict
     hits: list[dict]
     citations: list[dict]
     answer: str

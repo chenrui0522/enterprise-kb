@@ -35,7 +35,7 @@ class FakeSearchService:
         self.filters: list[dict | None] = []
 
     async def search(
-        self, query: str, tenant_id: str, filters: dict | None = None
+        self, query: str, tenant_id: str, filters: dict | None = None, principal=None
     ) -> list[SearchHit]:
         self.filters.append(filters)
         return self.hits

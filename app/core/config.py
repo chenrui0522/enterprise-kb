@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     auto_create_tables: bool = True
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
+    # Observability
+    log_level: str = "INFO"
+    log_json: bool = True
+    log_query_preview_chars: int = 64
+    health_check_timeout_seconds: float = 2.0
+
     # PostgreSQL
     database_url: str = "postgresql+asyncpg://kb:kb@localhost:5432/kb"
     db_pool_size: int = 10
@@ -36,6 +42,8 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "deepseek-v4-flash"
     llm_temperature: float = 0.2
+    # Flash defaults to thinking-on; RAG rewrite/judge/generate should keep this false.
+    llm_thinking_enabled: bool = False
 
     # Local embedding model (Xinference /v1 OpenAI-compatible)
     embedder_base_url: str = "http://localhost:9997/v1"
@@ -111,6 +119,14 @@ class Settings(BaseSettings):
     # Ingestion conversion behaviour
     conversion_triage_enabled: bool = True
     parse_cache_enabled: bool = True
+
+    # Auth / session
+    session_ttl_hours: int = 12
+    session_cookie_secure: bool = False
+    session_cookie_samesite: str = "lax"
+    login_max_failures: int = 5
+    login_lockout_seconds: int = 300
+    default_tenant_id: str = "autley"
 
     @property
     def docling_enabled(self) -> bool:

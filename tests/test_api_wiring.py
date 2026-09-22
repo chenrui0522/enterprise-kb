@@ -59,7 +59,14 @@ def stubbed_app(monkeypatch):
 
 def test_lifespan_starts_and_stops(stubbed_app) -> None:
     with TestClient(stubbed_app) as client:
-        assert client.get("/healthz").status_code == 200
+        response = client.get("/healthz")
+        # Without live deps the probe may report degraded/unavailable; the
+        # process must still answer with a structured payload.
+        assert response.status_code in {200, 503}
+        body = response.json()
+        assert body["status"] in {"ok", "degraded", "unavailable"}
+        assert set(body["checks"]) >= {"postgres", "redis", "milvus", "model_service"}
+        assert response.headers.get("X-Request-ID")
     # The graph must be wired even when the checkpointer falls back to
     # stateless mode - that is where the missing-import bug hid before.
     assert stubbed_app.state.chat_graph is not None

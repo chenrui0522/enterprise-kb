@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
-from app.core.logging import get_logger
+from app.core.logging import get_logger, log_event, timed_event
 from app.ingestion.cache import ParseCache
 from app.ingestion.chunker import (
     ChunkContext,
@@ -119,18 +119,21 @@ class IngestionPipeline:
     ) -> None:
         settings = self._settings or get_settings()
         file_path = self._storage.resolve(job["storage_key"])
+        pipeline_started = time.perf_counter()
         if job.get("reindex"):
             self._store.delete_by_version(version.id)
             self._storage.delete_version_assets(document.id, version.id)
             await self._delete_version_rows(session, version.id)
 
         await self._set_stage(session, document, version, "parsing")
-        started = time.perf_counter()
-        converted = await self._convert_to_markdown(document, version, file_path)
-        conversion_meta = dict(getattr(self, "_last_conversion_meta", {}) or {})
-        conversion_meta["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
-        conversion_meta.update(self._conversion_evidence(converted))
-        markdown = converted.markdown
+        with timed_event(logger, "ingest.convert", filename=document.filename) as convert_meta:
+            started = time.perf_counter()
+            converted = await self._convert_to_markdown(document, version, file_path)
+            conversion_meta = dict(getattr(self, "_last_conversion_meta", {}) or {})
+            conversion_meta["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+            conversion_meta.update(self._conversion_evidence(converted))
+            convert_meta["converter"] = conversion_meta.get("converter")
+            markdown = converted.markdown
 
         image_blocks: list[Block] = []
         image_warning: str | None = None
@@ -185,56 +188,71 @@ class IngestionPipeline:
             }
         )
 
-        context = ChunkContext(
-            doc_id=document.id,
-            version_id=version.id,
-            tenant_id=document.tenant_id,
-            title=document.title,
-        )
-        resolved_doc_type = (doc_type or getattr(version, "doc_type", "") or "").strip().lower()
-        if resolved_doc_type in {"", "auto"}:
-            resolved_doc_type = None
-        structure = (
-            converted.structure
-            if converted.structure and converted.structure.blocks
-            else structure_from_markdown(markdown, page_count=converted.page_count)
-        )
-        structure.blocks = [block for block in structure.blocks if block.type != BLOCK_IMAGE]
-        if image_blocks:
-            structure.blocks.extend(image_blocks)
-        resolved_version = chunker_version or DEFAULT_CHUNKER_VERSION
-        plan: ChunkPlan | None = None
-        if self._uses_parent_child(resolved_version):
-            # v2 chunks by document type, so an "auto" upload is classified here
-            # (and persisted) instead of inside the legacy chunker.
-            resolved_doc_type = resolved_doc_type or detect_doc_type(structure)
-            plan = build_chunk_plan(
-                structure,
-                context,
-                doc_type=resolved_doc_type,
-                params=params_for(resolved_doc_type, settings),
-                tables=list(converted.tables or []),
-                chunker_version=PARENT_CHILD_VERSION,
+        with timed_event(logger, "ingest.chunk") as chunk_meta:
+            context = ChunkContext(
+                doc_id=document.id,
+                version_id=version.id,
+                tenant_id=document.tenant_id,
+                title=document.title,
+                org_unit_id=getattr(version, "org_unit_id", None)
+                or getattr(document, "org_unit_id", None)
+                or "",
+                project_id=getattr(version, "project_id", None)
+                or getattr(document, "project_id", None)
+                or "",
+                domain=getattr(version, "domain", None) or getattr(document, "domain", None) or "",
+                classification=getattr(version, "classification", None)
+                or getattr(document, "classification", None)
+                or "general",
             )
-            drafts = plan.children
-        else:
-            drafts = chunk_structure(
-                structure,
-                context,
-                doc_type=resolved_doc_type,
-                chunk_size=chunk_size,
-                overlap=overlap,
-                chunker_version=resolved_version,
+            resolved_doc_type = (doc_type or getattr(version, "doc_type", "") or "").strip().lower()
+            if resolved_doc_type in {"", "auto"}:
+                resolved_doc_type = None
+            structure = (
+                converted.structure
+                if converted.structure and converted.structure.blocks
+                else structure_from_markdown(markdown, page_count=converted.page_count)
             )
-        if not drafts:
-            raise ValueError("切分后没有生成任何片段")
-        version.chunker_version = drafts[0].chunker_version if drafts else ""
+            structure.blocks = [block for block in structure.blocks if block.type != BLOCK_IMAGE]
+            if image_blocks:
+                structure.blocks.extend(image_blocks)
+            resolved_version = chunker_version or DEFAULT_CHUNKER_VERSION
+            plan: ChunkPlan | None = None
+            if self._uses_parent_child(resolved_version):
+                # v2 chunks by document type, so an "auto" upload is classified here
+                # (and persisted) instead of inside the legacy chunker.
+                resolved_doc_type = resolved_doc_type or detect_doc_type(structure)
+                plan = build_chunk_plan(
+                    structure,
+                    context,
+                    doc_type=resolved_doc_type,
+                    params=params_for(resolved_doc_type, settings),
+                    tables=list(converted.tables or []),
+                    chunker_version=PARENT_CHILD_VERSION,
+                )
+                drafts = plan.children
+            else:
+                drafts = chunk_structure(
+                    structure,
+                    context,
+                    doc_type=resolved_doc_type,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                    chunker_version=resolved_version,
+                )
+            if not drafts:
+                raise ValueError("切分后没有生成任何片段")
+            version.chunker_version = drafts[0].chunker_version if drafts else ""
+            chunk_meta["chunk_count"] = len(drafts)
 
         await self._set_stage(session, document, version, "embedding")
-        chunks = await self._embed_drafts(drafts, context)
+        with timed_event(logger, "ingest.embed", chunk_count=len(drafts)):
+            chunks = await self._embed_drafts(drafts, context)
 
         await self._set_stage(session, document, version, "indexing")
-        inserted = self._store.insert(chunks)
+        with timed_event(logger, "ingest.index") as index_meta:
+            inserted = self._store.insert(chunks)
+            index_meta["inserted"] = inserted
         old_version_id = document.current_version_id
 
         conversion_meta["images"] = len(image_blocks)
@@ -263,12 +281,15 @@ class IngestionPipeline:
         document.current_version_id = version.id
         document.error_message = image_warning
         await session.commit()
-        logger.info(
-            "Indexed doc=%s version=%s chunks=%s (replacing %s)",
-            document.id,
-            version.id,
-            inserted,
-            old_version_id,
+        log_event(
+            logger,
+            "ingest done",
+            event="ingest.done",
+            document_id=document.id,
+            version_id=version.id,
+            chunks=inserted,
+            duration_ms=int((time.perf_counter() - pipeline_started) * 1000),
+            ok=True,
         )
 
         if old_version_id and old_version_id != version.id:
@@ -288,7 +309,10 @@ class IngestionPipeline:
             candidates: list[tuple[str, FileConverter]] = [("injected", self._converter)]
         else:
             parse_mode = (version.parse_mode or "auto").lower()
-            triage = self._triage(file_path, document.filename, parse_mode, settings)
+            with timed_event(logger, "ingest.triage", filename=document.filename) as triage_meta:
+                triage = self._triage(file_path, document.filename, parse_mode, settings)
+                triage_meta["kind"] = triage.kind
+                triage_meta["reason"] = (triage.reason or "")[:120]
             docling_candidate = False
             if settings.docling_enabled:
                 docling_candidate = await docling_available(settings)
@@ -547,6 +571,10 @@ class IngestionPipeline:
                         image_id=draft.image_id,
                         chunk_kind=draft.chunk_kind,
                         doc_type=draft.doc_type,
+                        org_unit_id=context.org_unit_id or "",
+                        project_id=context.project_id or "",
+                        domain=context.domain or "",
+                        classification=context.classification or "general",
                     )
                 )
             done = min(start + batch_size, total)

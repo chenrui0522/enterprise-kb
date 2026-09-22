@@ -71,6 +71,7 @@ alembic upgrade head
 | 变量 | 说明 |
 |---|---|
 | `KB_LLM_API_KEY` / `KB_LLM_MODEL` | DeepSeek key 与模型（默认 `deepseek-v4-flash`） |
+| `KB_LLM_THINKING_ENABLED` | 是否开启 DeepSeek 思考模式（默认 `false`；RAG 改写/判定/生成应关闭） |
 | `KB_EMBEDDER_BASE_URL` / `KB_EMBEDDER_MODEL` | Xinference embedding 地址与 bge-m3 |
 | `KB_RERANKER_BASE_URL` / `KB_RERANKER_MODEL` | Xinference rerank 地址与模型 |
 | `KB_RERANK_MAX_CONCURRENCY` | 重排并发上限（CPU 默认 10，GPU 可调到 32） |
@@ -261,7 +262,39 @@ uv run python -m app.reindex --wait --timeout 3600            # 全量重导（�
 - `POST /api/v1/chat/stream`：SSE 流式问答（`message` + 可选 `conversation_id`）
 - `POST /api/v1/conversations`、`GET /api/v1/conversations`、`GET /api/v1/conversations/{id}/messages`
 - `POST /api/v1/feedback`：答案反馈占位
-- `GET /api/v1/audit/events`、`GET /healthz`
+- `GET /api/v1/audit/events`（需 `audit:read`；支持 `action` / `actor` / `since` / `until` / `offset` / `limit`）、`GET /healthz`
+
+## 可观测与运维日志
+
+默认输出 **JSON 单行日志**到 stdout（`KB_LOG_JSON=true`），便于 Compose 采集与 `grep`。
+
+| 配置 | 说明 |
+|---|---|
+| `KB_LOG_LEVEL` | 日志级别（默认 `INFO`） |
+| `KB_LOG_JSON` | 是否 JSON（默认 `true`；`false` 为可读文本） |
+| `KB_LOG_QUERY_PREVIEW_CHARS` | 问句写入日志的截断长度（默认 64） |
+| `KB_HEALTH_CHECK_TIMEOUT_SECONDS` | `/healthz` 各依赖探测超时（默认 2s） |
+
+- 每个 API 请求带 `X-Request-ID`（客户端可传入合法值，否则服务端生成），响应头回传；同请求的运维日志共享该字段。
+- 问答阶段事件示例：`chat.rewrite` / `chat.judge` / `chat.retrieve` / `chat.generate` / `chat.done`（含 `duration_ms`）。
+- 入库 worker 以 `job_id`（默认同 `version_id`）关联：`ingest.triage` / `ingest.convert` / `ingest.chunk` / `ingest.embed` / `ingest.index` / `ingest.done`。
+- 模型调用边界：`provider.call`（llm / embedder / reranker）。
+- 口令、Cookie、文档全文不会写入运维日志；问句默认截断。
+
+### 健康检查
+
+`GET /healthz` 返回：
+
+```json
+{"status":"ok|degraded|unavailable","checks":{"postgres":"ok|fail","redis":"ok|fail","milvus":"ok|fail","model_service":"ok|fail"}}
+```
+
+- PostgreSQL 失败 → `status=unavailable`，HTTP **503**
+- 仅 Milvus / 模型服务失败 → `status=degraded`，HTTP **200**
+
+### 审计查阅
+
+管理端「审计」页签（需 `audit:read`，如 auditor 角色）可按动作、操作者筛选本租户事件。关键写操作（登录、组织/岗位/绑岗/密级/项目成员、文档上传与重试、问答完成）会写入 `audit_events`。
 
 SSE 事件：`message_start` → `token`* → (`error`) → `done`。`done` 携带完整答案与 `citations`（文档名 + 页码）。
 
@@ -288,7 +321,7 @@ scripts/       init-models.sh 等
 - **OCR 与解析器**：`app/ingestion/triage.py` 负责分诊与路由（`plan_candidates`），`app/ingestion/mineru.py` / `app/ingestion/docling.py` 是两个独立解析服务的 HTTP 客户端，`app/ingestion/tabular.py` 做 XLSX 语义化，`app/ingestion/cache.py` 是内容寻址的解析缓存。调整路由只改 `triage.plan_candidates` 一处。旧文档解析失败后调用重试即走新解析。
 - **父子分块 / 表格两级处理**：`app/ingestion/parent_child.py`（父块打包、子块策略、表格行级与摘要），生成端展开在 `app/chat/parent_context.py`，元数据过滤表达式在 `app/retrieval/milvus_store.py:build_filter_expr`。
 - **换向量库 / 检索策略**：`app/retrieval/milvus_store.py` 是唯一直接触碰 Milvus 的地方。
-- **多租户 / 权限 / 审计 / 反馈**：所有表与集合均带 `tenant_id`；`app/chat/service.py` 的审计与反馈写入已预留，后续只需增加鉴权中间件与业务规则。
+- **多租户 / 权限 / 审计 / 反馈**：全集团单一 `tenant_id`（默认 `autley`）；太原/朔州/苏州是人身上的地点。身份模型为组织树 + 一人多岗（`user_positions`）+ 角色权限串 + 编制 + 密级 + 项目授权。登录后每请求现算 Principal，文档列表与 Milvus 召回共用可见性公式（部门/编制本级过密级，或项目∩专业不过密级）。规划见 `openspec/changes/add-org-tree-and-access-control/`（取代未落地的 `add-auth-and-rbac` / `add-corpus-access-scope`）。引导：`uv run python -m app.cli create-admin --username ... --password ... --clearance general --org-code gm_office`；演示种子：`uv run python -m app.cli seed-demo`。
 - **LangSmith / trace**：模型 provider 与图节点中已留出埋点位；本期使用结构化日志，无需改接口即可后续接入。
 
 ## 测试

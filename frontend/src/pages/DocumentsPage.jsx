@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import BrandLogo, { BRAND_PRODUCT_NAME } from "../BrandLogo.jsx";
 import { listDocumentImages, listDocuments, retryDocument, uploadDocument } from "../api.js";
+import { useAuth } from "../auth.jsx";
 
 const STATUS_LABEL = {
   pending: "排队中",
@@ -38,6 +40,7 @@ function DocIcon() {
 }
 
 export default function DocumentsPage() {
+  const { user, hasPermission } = useAuth();
   const [documents, setDocuments] = useState([]);
   const [message, setMessage] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -57,8 +60,17 @@ export default function DocumentsPage() {
 
   const upload = async (file) => {
     if (!file) return;
+    if (!hasPermission("documents:write")) {
+      setMessage("当前账号无上传权限");
+      return;
+    }
+    const orgUnitId = user?.org_unit_ids?.[0];
+    if (!orgUnitId) {
+      setMessage("当前账号没有可挂载的组织节点");
+      return;
+    }
     try {
-      await uploadDocument(file, { ocr });
+      await uploadDocument(file, { ocr, orgUnitId, classification: user?.clearance || "general" });
       setMessage("上传成功，正在后台处理");
       refresh();
     } catch (error) {
@@ -87,9 +99,9 @@ export default function DocumentsPage() {
   return (
     <div className="docs-layout">
       <aside className="sidebar">
-        <Link to="/" className="side-link">
-          <DocIcon />
-          企业知识库
+        <Link to="/" className="side-link brand-link">
+          <BrandLogo size={26} />
+          {BRAND_PRODUCT_NAME}
         </Link>
         <Link to="/" className="new-chat secondary">
           ← 返回对话

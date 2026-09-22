@@ -30,6 +30,10 @@ class ChunkRecord(BaseModel):
     parent_id: str = ""
     chunker_version: str = ""
     image_id: str = ""
+    org_unit_id: str = ""
+    project_id: str = ""
+    domain: str = ""
+    classification: str = "general"
 
 
 class SearchHit(BaseModel):
@@ -55,3 +59,7 @@ class SearchHit(BaseModel):
     parent_id: str = ""
     chunker_version: str = ""
     image_id: str = ""
+    org_unit_id: str = ""
+    project_id: str = ""
+    domain: str = ""
+    classification: str = "general"

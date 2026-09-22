@@ -13,7 +13,11 @@ from app.core.db import get_db_session
 from app.core.errors import NotFoundError
 from app.core.logging import get_logger
 from app.core.redis import get_redis
-from app.core.tenant import tenant_dependency
+from app.identity.constants import PERM_DOCUMENTS_READ, PERM_DOCUMENTS_WRITE
+from app.identity.deps import require_permission, tenant_from_principal
+from app.identity.principal import Principal
+from app.identity.visibility import can_upload_to, document_visible_clause
+from app.schemas.identity import validate_clearance, validate_domain
 from app.ingestion.doc_types import normalize_doc_type
 from app.ingestion.queue import enqueue_job, make_job
 from app.ingestion.storage import FileDocumentStorage
@@ -47,14 +51,27 @@ async def upload_document(
     file: UploadFile = File(...),
     ocr: bool = Query(False, description="强制走 MinerU OCR 解析扫描件/复杂彩页手册"),
     doc_type: str | None = Query(None, description="文档类型：faq / policy / sop / table / generic，缺省自动判断"),
+    org_unit_id: str | None = Query(None, description="所属组织节点"),
+    project_id: str | None = Query(None, description="可选项目"),
+    domain: str | None = Query(None, description="专业"),
+    classification: str = Query("general", description="密级 general|core"),
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    principal: Principal = Depends(require_permission(PERM_DOCUMENTS_WRITE)),
+    tenant_id: str = Depends(tenant_from_principal),
 ) -> DocumentUploadOut:
     settings = get_settings()
     try:
         resolved_doc_type = normalize_doc_type(doc_type)
+        resolved_domain = validate_domain(domain)
+        resolved_class = validate_clearance(classification)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    if project_id and not resolved_domain:
+        raise HTTPException(status_code=422, detail="挂到项目的文档必须指定专业")
+    if not can_upload_to(
+        principal, org_unit_id=org_unit_id, project_id=project_id, domain=resolved_domain
+    ):
+        raise HTTPException(status_code=403, detail="无权将文档挂到该组织或项目/专业")
     filename = file.filename or "unnamed.pdf"
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -95,6 +112,10 @@ async def upload_document(
         filename=filename,
         status="pending",
         stage="queued",
+        org_unit_id=org_unit_id,
+        project_id=project_id or None,
+        domain=resolved_domain,
+        classification=resolved_class,
     )
     session.add(document)
     await session.flush()
@@ -106,6 +127,10 @@ async def upload_document(
         storage_key="",
         parse_mode="ocr" if needs_ocr else "auto",
         doc_type=resolved_doc_type,
+        org_unit_id=org_unit_id,
+        project_id=project_id or None,
+        domain=resolved_domain,
+        classification=resolved_class,
     )
     session.add(version)
     await session.flush()
@@ -132,7 +157,8 @@ async def upload_document(
         action="document.upload",
         resource_type="document",
         resource_id=document.id,
-        detail={"filename": filename},
+        detail={"filename": filename, "org_unit_id": org_unit_id, "project_id": project_id},
+        actor=principal.username,
     )
     return DocumentUploadOut(id=document.id, status=document.status, stage=document.stage)
 
@@ -141,9 +167,15 @@ async def upload_document(
 async def list_documents(
     status: str | None = None,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    principal: Principal = Depends(require_permission(PERM_DOCUMENTS_READ)),
+    tenant_id: str = Depends(tenant_from_principal),
 ) -> list[DocumentOut]:
-    query = select(Document).where(Document.tenant_id == tenant_id).order_by(Document.created_at.desc())
+    query = (
+        select(Document)
+        .where(Document.tenant_id == tenant_id)
+        .where(document_visible_clause(principal))
+        .order_by(Document.created_at.desc())
+    )
     if status:
         query = query.where(Document.status == status)
     result = await session.execute(query.limit(200))
@@ -154,7 +186,8 @@ async def list_documents(
 async def document_detail(
     document_id: str,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    _principal: Principal = Depends(require_permission(PERM_DOCUMENTS_READ)),
 ) -> DocumentOut:
     document = await session.get(Document, document_id)
     if document is None or document.tenant_id != tenant_id:
@@ -166,7 +199,8 @@ async def document_detail(
 async def document_conversion_report(
     document_id: str,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    _principal: Principal = Depends(require_permission(PERM_DOCUMENTS_READ)),
 ) -> dict:
     """Latest conversion report of a document (converter, triage, counts, timing)."""
     document = await session.get(Document, document_id)
@@ -202,7 +236,8 @@ async def document_conversion_report(
 async def retry_document(
     document_id: str,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    _principal: Principal = Depends(require_permission(PERM_DOCUMENTS_READ)),
 ) -> dict:
     document = await session.get(Document, document_id)
     if document is None or document.tenant_id != tenant_id:
@@ -256,7 +291,8 @@ async def retry_document(
 async def document_tables(
     document_id: str,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    _principal: Principal = Depends(require_permission(PERM_DOCUMENTS_READ)),
 ) -> list[dict]:
     """List the tables stored for one document (metadata only)."""
     document = await session.get(Document, document_id)
@@ -288,7 +324,8 @@ async def document_table(
     document_id: str,
     table_id: str,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    _principal: Principal = Depends(require_permission(PERM_DOCUMENTS_READ)),
 ) -> dict:
     """Return one stored table grid by id (rows come from object storage)."""
     table = await session.get(DocumentTable, table_id)
@@ -320,7 +357,8 @@ async def document_table(
 async def document_images(
     document_id: str,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    _principal: Principal = Depends(require_permission(PERM_DOCUMENTS_READ)),
 ) -> list[dict]:
     """List stored images for one document so the UI can browse them."""
     document = await session.get(Document, document_id)
@@ -385,7 +423,8 @@ async def document_image(
     image_id: str,
     w: int | None = Query(None, description="缩略图宽度档位（64/200/400/800），省略返回原图"),
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
+    tenant_id: str = Depends(tenant_from_principal),
+    _principal: Principal = Depends(require_permission(PERM_DOCUMENTS_READ)),
 ):
     """Serve one stored document image (optionally a cached thumbnail)."""
     image = await session.get(DocumentImage, image_id)

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import BrandLogo, { BRAND_PRODUCT_NAME } from "../BrandLogo.jsx";
 import {
   createConversation,
   getMessages,
@@ -14,18 +15,6 @@ const SUGGESTIONS = [
   "打印机卡纸了应该怎么办？",
   "如何申请保修？",
 ];
-
-function SparkleIcon() {
-  return (
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path
-        d="M12 2l1.8 5.6L19.5 9l-5.7 1.4L12 16l-1.8-5.6L4.5 9l5.7-1.4L12 2z"
-        fill="currentColor"
-      />
-      <path d="M19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14z" fill="currentColor" />
-    </svg>
-  );
-}
 
 function RichText({ text }) {
   const parts = String(text || "").split(/\*\*(.+?)\*\*/g);
@@ -160,9 +149,9 @@ export default function ChatPage() {
   return (
     <div className="chat-layout">
       <aside className="sidebar">
-        <Link to="/" className="side-link">
-          <SparkleIcon />
-          企业知识库
+        <Link to="/" className="side-link brand-link">
+          <BrandLogo size={26} />
+          {BRAND_PRODUCT_NAME}
         </Link>
         <button className="new-chat" onClick={newConversation}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -224,7 +213,7 @@ export default function ChatPage() {
         {empty ? (
           <section className="welcome">
             <div className="welcome-logo">
-              <SparkleIcon />
+              <BrandLogo size={52} />
             </div>
             <h1>你好，我是你的企业知识库助手</h1>
             <p>上传产品手册与制度文档后，我可以基于文档回答你的问题，并支持连续追问。</p>

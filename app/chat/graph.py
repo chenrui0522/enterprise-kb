@@ -6,7 +6,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
 from app.chat.state import ChatState
-from app.core.logging import get_logger
+from app.core.logging import get_logger, preview_text, timed_event
 from app.providers.base import LLMProvider
 from app.retrieval.service import SearchService
 
@@ -102,124 +102,168 @@ class ChatGraph:
         return self._graph
 
     async def _rewrite(self, state: ChatState) -> dict:
-        question = state["user_question"]
-        normalized = _normalize(question)
-        if normalized in {item.strip().lower() for item in GREETINGS}:
-            return {"rewritten_query": question}
-        history = _last_exchanges(state["history"], self._history_turns)
-        if not history:
-            return {"rewritten_query": question}
-        transcript = "\n".join(
-            f"{'用户' if message['role'] == 'user' else '助手'}: {message['content']}"
-            for message in history[-6:]
-        )
-        payload = await self._llm.complete_json(
-            system=REWRITE_SYSTEM,
-            user=f"【最近对话】\n{transcript}\n\n【用户最新问题】\n{question}",
-            temperature=0.1,
-        )
-        rewritten = str(payload.get("rewritten_query") or question).strip()
-        return {"rewritten_query": rewritten or question}
+        with timed_event(
+            logger,
+            "chat.rewrite",
+            query_preview=preview_text(state["user_question"]),
+        ) as meta:
+            question = state["user_question"]
+            normalized = _normalize(question)
+            if normalized in {item.strip().lower() for item in GREETINGS}:
+                meta["skipped"] = "greeting"
+                return {"rewritten_query": question}
+            history = _last_exchanges(state["history"], self._history_turns)
+            if not history:
+                meta["skipped"] = "no_history"
+                return {"rewritten_query": question}
+            transcript = "\n".join(
+                f"{'用户' if message['role'] == 'user' else '助手'}: {message['content']}"
+                for message in history[-6:]
+            )
+            payload = await self._llm.complete_json(
+                system=REWRITE_SYSTEM,
+                user=f"【最近对话】\n{transcript}\n\n【用户最新问题】\n{question}",
+                temperature=0.1,
+            )
+            rewritten = str(payload.get("rewritten_query") or question).strip()
+            return {"rewritten_query": rewritten or question}
 
     async def _need_retrieval(self, state: ChatState) -> dict:
-        question = state["user_question"]
-        normalized = _normalize(question)
-        if normalized in {item.strip().lower() for item in GREETINGS}:
-            return {"need_retrieval": False}
-        history = _last_exchanges(state["history"], self._history_turns)
-        transcript = "\n".join(
-            f"{'用户' if message['role'] == 'user' else '助手'}: {message['content']}"
-            for message in history[-6:]
-        )
-        payload = await self._llm.complete_json(
-            system=JUDGE_SYSTEM,
-            user=f"【最近对话】\n{transcript}\n\n【用户最新问题】\n{question}",
-            temperature=0.0,
-        )
-        return {"need_retrieval": bool(payload.get("need_retrieval", True))}
+        with timed_event(logger, "chat.judge") as meta:
+            question = state["user_question"]
+            normalized = _normalize(question)
+            if normalized in {item.strip().lower() for item in GREETINGS}:
+                meta["need_retrieval"] = False
+                return {"need_retrieval": False}
+            history = _last_exchanges(state["history"], self._history_turns)
+            transcript = "\n".join(
+                f"{'用户' if message['role'] == 'user' else '助手'}: {message['content']}"
+                for message in history[-6:]
+            )
+            payload = await self._llm.complete_json(
+                system=JUDGE_SYSTEM,
+                user=f"【最近对话】\n{transcript}\n\n【用户最新问题】\n{question}",
+                temperature=0.0,
+            )
+            need = bool(payload.get("need_retrieval", True))
+            meta["need_retrieval"] = need
+            return {"need_retrieval": need}
 
     async def _retrieve(self, state: ChatState) -> dict:
-        query = state.get("rewritten_query") or state["user_question"]
-        filters = state.get("filters") or None
-        hits = await self._search_service.search(query, state["tenant_id"], filters=filters)
-        payload = [hit.model_dump() for hit in hits]
-        if self._parent_expander is not None and payload:
-            payload = await self._parent_expander(payload)
-        return {"hits": payload}
+        with timed_event(logger, "chat.retrieve") as meta:
+            query = state.get("rewritten_query") or state["user_question"]
+            filters = state.get("filters") or None
+            principal = None
+            scope = state.get("principal_scope") or {}
+            if scope:
+                from app.identity.principal import Principal
+
+                principal = Principal(
+                    user_id=scope.get("user_id", ""),
+                    tenant_id=state["tenant_id"],
+                    username=scope.get("username", ""),
+                    display_name=scope.get("display_name", ""),
+                    site=scope.get("site", ""),
+                    clearance=scope.get("clearance", "general"),
+                    org_unit_ids=tuple(scope.get("org_unit_ids") or ()),
+                    domains=tuple(scope.get("domains") or ()),
+                    project_ids=tuple(scope.get("project_ids") or ()),
+                    permissions=tuple(scope.get("permissions") or ()),
+                )
+            hits = await self._search_service.search(
+                query, state["tenant_id"], filters=filters, principal=principal
+            )
+            payload = [hit.model_dump() for hit in hits]
+            if self._parent_expander is not None and payload:
+                payload = await self._parent_expander(payload)
+            meta["hit_count"] = len(payload)
+            return {"hits": payload}
 
     async def _direct_answer(self, state: ChatState) -> dict:
-        question = state["user_question"]
-        normalized = _normalize(question)
-        direct_reply = next((reply for key, reply in GREETING_REPLIES.items() if normalized == key), None)
-        if direct_reply is not None:
-            content = direct_reply
-        else:
-            previous = next(
-                (message for message in reversed(state["history"]) if message["role"] == "assistant"),
-                None,
+        with timed_event(logger, "chat.direct_answer"):
+            question = state["user_question"]
+            normalized = _normalize(question)
+            direct_reply = next(
+                (reply for key, reply in GREETING_REPLIES.items() if normalized == key), None
             )
-            context = f"上一轮回答：{previous['content']}\n\n" if previous else ""
-            content = await self._llm.complete(system=DIRECT_ANSWER_SYSTEM, user=f"{context}{question}")
-        return {
-            "answer": content,
-            "citations": [],
-            "refused": False,
-        }
-
-    async def _generate(self, state: ChatState) -> dict:
-        writer = get_stream_writer()
-        hits = state.get("hits", [])
-        if not hits:
-            writer({"type": "token", "content": REFUSAL_ANSWER})
+            if direct_reply is not None:
+                content = direct_reply
+            else:
+                previous = next(
+                    (
+                        message
+                        for message in reversed(state["history"])
+                        if message["role"] == "assistant"
+                    ),
+                    None,
+                )
+                context = f"上一轮回答：{previous['content']}\n\n" if previous else ""
+                content = await self._llm.complete(
+                    system=DIRECT_ANSWER_SYSTEM, user=f"{context}{question}"
+                )
             return {
-                "answer": REFUSAL_ANSWER,
+                "answer": content,
                 "citations": [],
-                "refused": True,
-                "refusal_reason": "no_relevant_content",
+                "refused": False,
             }
 
-        references = []
-        citations = []
-        for index, hit in enumerate(hits, start=1):
-            # Generation uses the parent context when available (小块检索、大块生成);
-            # citations keep pointing at the retrieved child for precision.
-            context_text = hit.get("context_text") or hit["text"]
-            references.append(
-                f"[{index}]《{hit['title']}》第{hit['page']}页"
-                + (f"（{hit['section']}）" if hit.get("section") else "")
-                + f"：{context_text}"
-            )
-            citations.append(
-                {
-                    "chunk_id": hit["chunk_id"],
-                    "doc_id": hit["doc_id"],
-                    "document_title": hit["title"],
-                    "page": hit["page"],
-                    "section": hit.get("section") or None,
-                    "image_id": hit.get("image_id") or None,
-                    "version_id": hit.get("version_id") or None,
-                    "heading_path": hit.get("heading_path") or None,
-                    "chunk_kind": hit.get("chunk_kind") or "child",
-                    "table_id": hit.get("table_id") or None,
-                    "row_index": int(hit.get("row_index") or 0),
-                    "parent_id": hit.get("parent_id") or None,
+    async def _generate(self, state: ChatState) -> dict:
+        with timed_event(logger, "chat.generate") as meta:
+            writer = get_stream_writer()
+            hits = state.get("hits", [])
+            if not hits:
+                writer({"type": "token", "content": REFUSAL_ANSWER})
+                meta["refused"] = True
+                return {
+                    "answer": REFUSAL_ANSWER,
+                    "citations": [],
+                    "refused": True,
+                    "refusal_reason": "no_relevant_content",
                 }
-            )
-        system = GENERATE_SYSTEM_TEMPLATE.format(references="\n".join(references))
 
-        full_text: list[str] = []
-        try:
-            async for delta in self._llm.stream(system=system, user=state["user_question"]):
-                full_text.append(delta)
-                writer({"type": "token", "content": delta})
-        except Exception as exc:
-            logger.exception("Generation stream failed")
-            writer({"type": "error", "detail": f"生成失败：{exc}"})
-            raise
+            references = []
+            citations = []
+            for index, hit in enumerate(hits, start=1):
+                # Generation uses the parent context when available (小块检索、大块生成);
+                # citations keep pointing at the retrieved child for precision.
+                context_text = hit.get("context_text") or hit["text"]
+                references.append(
+                    f"[{index}]《{hit['title']}》第{hit['page']}页"
+                    + (f"（{hit['section']}）" if hit.get("section") else "")
+                    + f"：{context_text}"
+                )
+                citations.append(
+                    {
+                        "chunk_id": hit["chunk_id"],
+                        "doc_id": hit["doc_id"],
+                        "document_title": hit["title"],
+                        "page": hit["page"],
+                        "section": hit.get("section") or None,
+                        "image_id": hit.get("image_id") or None,
+                        "version_id": hit.get("version_id") or None,
+                        "heading_path": hit.get("heading_path") or None,
+                        "chunk_kind": hit.get("chunk_kind") or "child",
+                        "table_id": hit.get("table_id") or None,
+                        "row_index": int(hit.get("row_index") or 0),
+                        "parent_id": hit.get("parent_id") or None,
+                    }
+                )
+            system = GENERATE_SYSTEM_TEMPLATE.format(references="\n".join(references))
 
-        content = "".join(full_text)
-        return {
-            "answer": content,
-            "citations": citations,
-            "refused": False,
-        }
+            full_text: list[str] = []
+            try:
+                async for delta in self._llm.stream(system=system, user=state["user_question"]):
+                    full_text.append(delta)
+                    writer({"type": "token", "content": delta})
+            except Exception as exc:
+                logger.exception("Generation stream failed")
+                writer({"type": "error", "detail": f"生成失败：{exc}"})
+                raise
+
+            content = "".join(full_text)
+            meta["citation_count"] = len(citations)
+            return {
+                "answer": content,
+                "citations": citations,
+                "refused": False,
+            }

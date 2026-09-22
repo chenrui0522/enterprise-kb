@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 import app.api.routers.documents as documents_router
 from app.api.routers.documents import router
 from app.core.db import get_db_session
-from app.core.tenant import tenant_dependency
+from app.identity.constants import PERM_DOCUMENTS_READ, PERM_DOCUMENTS_WRITE
+from app.identity.deps import get_current_principal, require_permission, tenant_from_principal
+from app.identity.principal import Principal
 
 
 class FakeSession:
@@ -35,6 +37,21 @@ class FakeSettings:
         self.mineru_enabled = False
 
 
+def _test_principal() -> Principal:
+    return Principal(
+        user_id="u-test",
+        tenant_id="t1",
+        username="tester",
+        display_name="tester",
+        site="taiyuan",
+        clearance="general",
+        org_unit_ids=("org-software",),
+        domains=("software",),
+        project_ids=(),
+        permissions=(PERM_DOCUMENTS_READ, PERM_DOCUMENTS_WRITE, "chat:use"),
+    )
+
+
 def _client(monkeypatch, tmp_path, session: FakeSession) -> TestClient:
     async def _session_override():
         yield session
@@ -50,7 +67,10 @@ def _client(monkeypatch, tmp_path, session: FakeSession) -> TestClient:
     app = FastAPI()
     app.include_router(router, prefix="/api/v1")
     app.dependency_overrides[get_db_session] = _session_override
-    app.dependency_overrides[tenant_dependency] = lambda: "t1"
+    app.dependency_overrides[tenant_from_principal] = lambda: "t1"
+    app.dependency_overrides[get_current_principal] = _test_principal
+    for code in (PERM_DOCUMENTS_READ, PERM_DOCUMENTS_WRITE):
+        app.dependency_overrides[require_permission(code)] = _test_principal
     return TestClient(app)
 
 
@@ -58,22 +78,34 @@ def test_upload_accepts_valid_doc_type(monkeypatch, tmp_path) -> None:
     session = FakeSession()
     client = _client(monkeypatch, tmp_path, session)
     response = client.post(
-        "/api/v1/documents?doc_type=policy",
+        "/api/v1/documents?doc_type=policy&org_unit_id=org-software",
         files={"file": ("policy.pdf", b"%PDF-1.4 test", "application/pdf")},
     )
     assert response.status_code == 202
     version = next(obj for obj in session.added if obj.__class__.__name__ == "DocumentVersion")
     assert version.doc_type == "policy"
+    assert version.org_unit_id == "org-software"
 
 
 def test_upload_rejects_unknown_doc_type(monkeypatch, tmp_path) -> None:
     session = FakeSession()
     client = _client(monkeypatch, tmp_path, session)
     response = client.post(
-        "/api/v1/documents?doc_type=white-paper",
+        "/api/v1/documents?doc_type=white-paper&org_unit_id=org-software",
         files={"file": ("policy.pdf", b"%PDF-1.4 test", "application/pdf")},
     )
     assert response.status_code == 422
+    assert not session.added
+
+
+def test_upload_rejects_out_of_scope_org(monkeypatch, tmp_path) -> None:
+    session = FakeSession()
+    client = _client(monkeypatch, tmp_path, session)
+    response = client.post(
+        "/api/v1/documents?org_unit_id=org-procurement",
+        files={"file": ("policy.pdf", b"%PDF-1.4 test", "application/pdf")},
+    )
+    assert response.status_code == 403
     assert not session.added
 
 def test_document_image_endpoint_serves_file(monkeypatch, tmp_path) -> None:

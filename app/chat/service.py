@@ -13,29 +13,47 @@ from app.models.entity import (
 )
 
 
-async def create_conversation(session: AsyncSession, tenant_id: str, title: str | None = None) -> Conversation:
-    conversation = Conversation(tenant_id=tenant_id, title=title or "新对话")
+async def create_conversation(
+    session: AsyncSession,
+    tenant_id: str,
+    title: str | None = None,
+    *,
+    created_by: str = "local-user",
+) -> Conversation:
+    conversation = Conversation(
+        tenant_id=tenant_id, title=title or "新对话", created_by=created_by
+    )
     session.add(conversation)
     await session.commit()
     await session.refresh(conversation)
     return conversation
 
 
-async def list_conversations(session: AsyncSession, tenant_id: str, limit: int = 50) -> list[Conversation]:
-    result = await session.execute(
-        select(Conversation)
-        .where(Conversation.tenant_id == tenant_id)
-        .order_by(Conversation.updated_at.desc())
-        .limit(limit)
-    )
+async def list_conversations(
+    session: AsyncSession,
+    tenant_id: str,
+    limit: int = 50,
+    *,
+    created_by: str | None = None,
+) -> list[Conversation]:
+    query = select(Conversation).where(Conversation.tenant_id == tenant_id)
+    if created_by is not None:
+        query = query.where(Conversation.created_by == created_by)
+    result = await session.execute(query.order_by(Conversation.updated_at.desc()).limit(limit))
     return list(result.scalars())
 
 
 async def get_conversation(
-    session: AsyncSession, tenant_id: str, conversation_id: str
+    session: AsyncSession,
+    tenant_id: str,
+    conversation_id: str,
+    *,
+    created_by: str | None = None,
 ) -> Conversation:
     conversation = await session.get(Conversation, conversation_id)
     if conversation is None or conversation.tenant_id != tenant_id:
+        raise NotFoundError("会话不存在")
+    if created_by is not None and conversation.created_by != created_by:
         raise NotFoundError("会话不存在")
     return conversation
 

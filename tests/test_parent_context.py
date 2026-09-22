@@ -168,7 +168,7 @@ class _FakeLLM:
 
 
 class _FakeSearch:
-    async def search(self, query, tenant_id, filters=None):  # noqa: ARG002
+    async def search(self, query, tenant_id, filters=None, principal=None):  # noqa: ARG002
         return [
             SearchHit(
                 chunk_id="c1",

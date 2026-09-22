@@ -1,44 +1,164 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import select
+import asyncio
+from typing import Any
+
+import httpx
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, Response
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.db import get_db_session
+from app.core.db import get_db_session, get_engine
 from app.core.redis import get_redis
+from app.identity.constants import PERM_AUDIT_READ
+from app.identity.deps import require_permission, tenant_from_principal
+from app.identity.principal import Principal
 from app.models.entity import AuditEvent
-from app.core.tenant import tenant_dependency
+from app.retrieval.milvus_store import MilvusStore
 
 router = APIRouter(tags=["system"])
 
 
-@router.get("/healthz")
-async def healthz() -> dict:
-    settings = get_settings()
-    checks: dict[str, str] = {"status": "ok"}
+def _parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text_value = value.strip()
+    if text_value.endswith("Z"):
+        text_value = text_value[:-1] + "+00:00"
+    return datetime.fromisoformat(text_value)
+
+
+async def _check_postgres(timeout: float) -> str:
     try:
-        redis = get_redis()
-        await redis.ping()
-        checks["redis"] = "ok"
+
+        async def _ping() -> None:
+            engine = get_engine()
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+
+        await asyncio.wait_for(_ping(), timeout=timeout)
+        return "ok"
     except Exception:
-        checks["redis"] = "unavailable"
-    return checks
+        return "fail"
+
+
+async def _check_redis(timeout: float) -> str:
+    try:
+
+        async def _ping() -> None:
+            redis = get_redis()
+            await redis.ping()
+
+        await asyncio.wait_for(_ping(), timeout=timeout)
+        return "ok"
+    except Exception:
+        return "fail"
+
+
+async def _check_milvus(timeout: float) -> str:
+    try:
+        settings = get_settings()
+
+        def _ping() -> None:
+            store = MilvusStore(settings)
+            # Lightweight: ensure client can talk to the server.
+            store._client.list_collections()  # noqa: SLF001 - health probe only
+
+        await asyncio.wait_for(asyncio.to_thread(_ping), timeout=timeout)
+        return "ok"
+    except Exception:
+        return "fail"
+
+
+async def _check_model_service(timeout: float) -> str:
+    settings = get_settings()
+    base = settings.embedder_base_url.rstrip("/")
+    # OpenAI-compatible root is .../v1; health is typically on the host root.
+    if base.endswith("/v1"):
+        health_url = f"{base[:-3]}/v1/models"
+    else:
+        health_url = f"{base}/models"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(health_url)
+            resp.raise_for_status()
+        return "ok"
+    except Exception:
+        return "fail"
+
+
+@router.get("/healthz")
+async def healthz(response: Response) -> dict[str, Any]:
+    settings = get_settings()
+    timeout = settings.health_check_timeout_seconds
+    postgres, redis, milvus, model_service = await asyncio.gather(
+        _check_postgres(timeout),
+        _check_redis(timeout),
+        _check_milvus(timeout),
+        _check_model_service(timeout),
+    )
+    checks = {
+        "postgres": postgres,
+        "redis": redis,
+        "milvus": milvus,
+        "model_service": model_service,
+    }
+    if postgres == "fail":
+        status = "unavailable"
+        response.status_code = 503
+    elif any(value == "fail" for value in checks.values()):
+        status = "degraded"
+        response.status_code = 200
+    else:
+        status = "ok"
+        response.status_code = 200
+    return {"status": status, "checks": checks}
 
 
 @router.get("/api/v1/audit/events")
 async def list_audit_events(
     limit: int = 100,
+    offset: int = 0,
+    action: str | None = None,
+    actor: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
     session: AsyncSession = Depends(get_db_session),
-    tenant_id: str = Depends(tenant_dependency),
-) -> list[dict]:
+    principal: Principal = Depends(require_permission(PERM_AUDIT_READ)),
+    tenant_id: str = Depends(tenant_from_principal),
+) -> dict:
+    clauses = [AuditEvent.tenant_id == tenant_id]
+    if action:
+        clauses.append(AuditEvent.action == action)
+    if actor:
+        clauses.append(AuditEvent.actor == actor)
+    try:
+        since_dt = _parse_time(since)
+        until_dt = _parse_time(until)
+    except ValueError as exc:
+        from app.core.errors import AppError
+
+        raise AppError(f"无效的时间参数: {exc}", status_code=422) from exc
+    if since_dt is not None:
+        clauses.append(AuditEvent.created_at >= since_dt)
+    if until_dt is not None:
+        clauses.append(AuditEvent.created_at <= until_dt)
+
+    where = and_(*clauses)
+    total = (
+        await session.execute(select(func.count()).select_from(AuditEvent).where(where))
+    ).scalar_one()
     result = await session.execute(
         select(AuditEvent)
-        .where(AuditEvent.tenant_id == tenant_id)
+        .where(where)
         .order_by(AuditEvent.created_at.desc())
-        .limit(min(limit, 500))
+        .offset(max(offset, 0))
+        .limit(min(max(limit, 1), 500))
     )
-    return [
+    items = [
         {
             "id": event.id,
             "tenant_id": event.tenant_id,
@@ -51,3 +171,4 @@ async def list_audit_events(
         }
         for event in result.scalars()
     ]
+    return {"total": total, "offset": max(offset, 0), "limit": min(max(limit, 1), 500), "items": items}
