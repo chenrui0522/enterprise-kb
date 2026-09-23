@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -144,7 +144,11 @@ class Conversation(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False, default="新对话")
+    title_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="default", server_default="default"
+    )  # default | auto | user
     created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="local-user")
+    tool_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class Message(Base, TimestampMixin):
@@ -159,6 +163,28 @@ class Message(Base, TimestampMixin):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     rewritten_query: Mapped[str | None] = mapped_column(Text, nullable=True)
     meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    compressed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    summary_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("conversation_summaries.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class ConversationSummary(Base, TimestampMixin):
+    __tablename__ = "conversation_summaries"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    covered_from_message_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    covered_to_message_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
 
 
 class MessageCitation(Base, TimestampMixin):

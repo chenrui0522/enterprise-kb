@@ -1,13 +1,22 @@
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import BrandLogo, { BRAND_PRODUCT_NAME } from "../BrandLogo.jsx";
 import {
+  chatToolAction,
   createConversation,
+  exportStaffingXlsx,
+  getConversationMemory,
   getMessages,
+  listChatTools,
   listConversations,
+  listMyStaffingProjects,
   streamChat,
   submitFeedback,
+  updateConversationTitle,
+  uploadChatAttachment,
 } from "../api.js";
+import { useAuth } from "../auth.jsx";
+import StaffingSummaryPanel from "../components/StaffingSummaryPanel.jsx";
 
 const SUGGESTIONS = [
   "ZB-100 打印机的保修期是多久？",
@@ -16,17 +25,218 @@ const SUGGESTIONS = [
   "如何申请保修？",
 ];
 
+const STORAGE_KEY = "kb:lastConversationId";
+
 function RichText({ text }) {
   const parts = String(text || "").split(/\*\*(.+?)\*\*/g);
   return parts.map((part, index) => (index % 2 === 1 ? <strong key={index}>{part}</strong> : part));
 }
 
+function StaffingBatchCard({ card, disabled, onConfirm }) {
+  const needsProject = !card.project_id;
+  const collisions = card.collisions || [];
+  const [projects, setProjects] = useState([]);
+  const [projectId, setProjectId] = useState(card.project_id || "");
+  const [loadError, setLoadError] = useState("");
+  const [collisionChoices, setCollisionChoices] = useState(() => {
+    const init = {};
+    for (const c of collisions) {
+      if (c.person_name) init[c.person_name] = { action: "split" };
+    }
+    return init;
+  });
+
+  useEffect(() => {
+    if (!needsProject) return undefined;
+    let cancelled = false;
+    listMyStaffingProjects()
+      .then((rows) => {
+        if (cancelled) return;
+        const preferred = card.project_candidates || [];
+        const merged = [...preferred];
+        for (const row of rows || []) {
+          if (!merged.some((p) => p.id === row.id)) merged.push(row);
+        }
+        setProjects(merged);
+        if (!projectId && preferred.length === 1) setProjectId(preferred[0].id);
+        else if (!projectId && merged.length === 1) setProjectId(merged[0].id);
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(err.message || "无法加载项目列表");
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [needsProject, card.batch_id]);
+
+  const collisionsReady =
+    collisions.length === 0 ||
+    collisions.every((c) => {
+      const choice = collisionChoices[c.person_name];
+      if (!choice) return false;
+      if (choice.action === "split") return true;
+      return choice.action === "merge" && choice.keep_kind;
+    });
+
+  const setCollisionAction = (name, action) => {
+    setCollisionChoices((prev) => ({
+      ...prev,
+      [name]:
+        action === "merge"
+          ? { action: "merge", keep_kind: prev[name]?.keep_kind || "internal_formal" }
+          : { action: "split" },
+    }));
+  };
+
+  return (
+    <div className="tool-card">
+      <div className="tool-card-title">人员投入 · 导入批次</div>
+      <p className="muted">
+        {card.filename} · {card.status}
+        {card.warning_count ? ` · 告警 ${card.warning_count}` : ""}
+      </p>
+      {needsProject ? (
+        <div className="tool-card-project">
+          <label>
+            选定项目
+            <select
+              value={projectId}
+              disabled={disabled}
+              onChange={(e) => setProjectId(e.target.value)}
+            >
+              <option value="">请选择要入库的项目</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.code} · {p.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {card.match_codes?.length ? (
+            <p className="muted tool-card-hint">文件识别项目码：{card.match_codes.join("、")}</p>
+          ) : null}
+          {loadError ? <p className="tool-card-error">{loadError}</p> : null}
+          {!loadError && projects.length === 0 ? (
+            <p className="tool-card-error">你名下没有可导入的项目，请联系管理员授权项目成员。</p>
+          ) : null}
+        </div>
+      ) : null}
+      {collisions.length ? (
+        <div className="tool-card-collisions">
+          <div className="tool-card-subtitle">同名双身份 — 请裁定</div>
+          {collisions.map((c) => {
+            const choice = collisionChoices[c.person_name] || { action: "split" };
+            return (
+              <div className="collision-row" key={c.person_name}>
+                <div className="collision-name">{c.person_name}</div>
+                <p className="muted">{c.message}</p>
+                <div className="collision-actions">
+                  <label>
+                    <input
+                      type="radio"
+                      name={`col-${card.batch_id}-${c.person_name}`}
+                      checked={choice.action === "split"}
+                      disabled={disabled}
+                      onChange={() => setCollisionAction(c.person_name, "split")}
+                    />
+                    不同人（分列）
+                  </label>
+                  <label>
+                    <input
+                      type="radio"
+                      name={`col-${card.batch_id}-${c.person_name}`}
+                      checked={choice.action === "merge"}
+                      disabled={disabled}
+                      onChange={() => setCollisionAction(c.person_name, "merge")}
+                    />
+                    同一人，保留
+                  </label>
+                  {choice.action === "merge" ? (
+                    <select
+                      value={choice.keep_kind || "internal_formal"}
+                      disabled={disabled}
+                      onChange={(e) =>
+                        setCollisionChoices((prev) => ({
+                          ...prev,
+                          [c.person_name]: { action: "merge", keep_kind: e.target.value },
+                        }))
+                      }
+                    >
+                      <option value="internal_formal">正式我司</option>
+                      <option value="internal_contract">我司·外包性质</option>
+                    </select>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+      {card.warnings?.length ? (
+        <ul className="tool-card-list">
+          {card.warnings
+            .filter((w) => w.code !== "name_kind_collision")
+            .slice(0, 8)
+            .map((w, i) => (
+              <li key={`${w.code}-${i}`}>
+                {w.code}: {w.message}
+              </li>
+            ))}
+        </ul>
+      ) : null}
+      <div className="tool-card-actions">
+        {(card.actions || []).map((a) => (
+          <button
+            key={a.id}
+            type="button"
+            disabled={
+              disabled ||
+              (a.id === "ack_and_confirm" &&
+                ((needsProject && !projectId) || !collisionsReady))
+            }
+            onClick={() =>
+              onConfirm(a.id, {
+                batch_id: card.batch_id,
+                project_id: projectId || card.project_id || null,
+                name_kind_collision: collisions.length ? collisionChoices : undefined,
+              })
+            }
+          >
+            {a.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function persistConversationId(id) {
+  if (!id) {
+    localStorage.removeItem(STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(STORAGE_KEY, id);
+}
+
 export default function ChatPage() {
+  const { hasPermission } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [conversations, setConversations] = useState([]);
   const [conversationId, setConversationId] = useState(null);
   const [conversationTitle, setConversationTitle] = useState("新对话");
+  const [editingTitleId, setEditingTitleId] = useState(null);
+  const [editingTitleDraft, setEditingTitleDraft] = useState("");
+  const editingTitleIdRef = useRef(null);
   const [messages, setMessages] = useState([]);
+  const [memory, setMemory] = useState(null);
+  const [sessionError, setSessionError] = useState("");
   const [lightbox, setLightbox] = useState(null);
+  const [tools, setTools] = useState([]);
+  const [activeTool, setActiveTool] = useState("");
+  const [toolMenuOpen, setToolMenuOpen] = useState(false);
+  const [attachment, setAttachment] = useState(null);
+  const [attachBusy, setAttachBusy] = useState(false);
   const galleryFor = (message) => (message.citations || []).flatMap((item) => item.images || []);
 
   useEffect(() => {
@@ -48,6 +258,7 @@ export default function ChatPage() {
   const [loading, setLoading] = useState(false);
   const textareaRef = useRef(null);
   const bottomRef = useRef(null);
+  const restoredRef = useRef(false);
 
   const refreshConversations = async () => {
     const rows = await listConversations();
@@ -55,9 +266,63 @@ export default function ChatPage() {
     return rows;
   };
 
+  const loadMemory = async (id) => {
+    if (!id) {
+      setMemory(null);
+      return;
+    }
+    try {
+      const row = await getConversationMemory(id);
+      setMemory(row && row.content ? row : null);
+    } catch {
+      setMemory(null);
+    }
+  };
+
+  const applyConversationId = (id, { syncUrl = true } = {}) => {
+    setConversationId(id);
+    persistConversationId(id);
+    if (syncUrl) {
+      if (id) setSearchParams({ c: id }, { replace: true });
+      else setSearchParams({}, { replace: true });
+    }
+  };
+
+  const openConversation = async (conversation) => {
+    setSessionError("");
+    applyConversationId(conversation.id);
+    setConversationTitle(conversation.title || "新对话");
+    setMessages(await getMessages(conversation.id));
+    await loadMemory(conversation.id);
+  };
+
   useEffect(() => {
-    refreshConversations().catch(console.error);
+    refreshConversations()
+      .then(async (rows) => {
+        if (restoredRef.current) return;
+        restoredRef.current = true;
+        const fromUrl = searchParams.get("c");
+        const fromStore = localStorage.getItem(STORAGE_KEY);
+        const wanted = fromUrl || fromStore;
+        if (!wanted) return;
+        const match = rows.find((item) => item.id === wanted);
+        if (match) {
+          await openConversation(match);
+          return;
+        }
+        setSessionError("无法恢复该会话（不存在或无权限），已开始新对话。");
+        persistConversationId(null);
+        setSearchParams({}, { replace: true });
+      })
+      .catch(console.error);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    listChatTools()
+      .then(setTools)
+      .catch(() => setTools([]));
+  }, [hasPermission]);
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -67,43 +332,127 @@ export default function ChatPage() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, loading]);
 
-  const openConversation = async (conversation) => {
-    setConversationId(conversation.id);
-    setConversationTitle(conversation.title || "新对话");
-    setMessages(await getMessages(conversation.id));
-  };
-
   const newConversation = async () => {
+    setSessionError("");
     const conversation = await createConversation();
     const rows = await refreshConversations();
-    setConversationId(conversation.id);
+    applyConversationId(conversation.id);
     setConversationTitle(conversation.title || "新对话");
     setMessages([]);
+    setMemory(null);
+    setAttachment(null);
+    setActiveTool("");
     setConversations(rows);
+    setEditingTitleId(null);
+  };
+
+  const beginRename = (conversation) => {
+    editingTitleIdRef.current = conversation.id;
+    setEditingTitleId(conversation.id);
+    setEditingTitleDraft(conversation.title || "新对话");
+  };
+
+  const cancelRename = () => {
+    editingTitleIdRef.current = null;
+    setEditingTitleId(null);
+  };
+
+  const commitRename = async () => {
+    const id = editingTitleIdRef.current;
+    if (!id) return;
+    const next = (editingTitleDraft || "").trim();
+    if (!next) {
+      setSessionError("标题不能为空");
+      cancelRename();
+      return;
+    }
+    const prev =
+      conversations.find((c) => c.id === id)?.title ||
+      (id === conversationId ? conversationTitle : "");
+    if (next === prev) {
+      cancelRename();
+      return;
+    }
+    editingTitleIdRef.current = null;
+    setEditingTitleId(null);
+    try {
+      const updated = await updateConversationTitle(id, next);
+      setConversations((rows) =>
+        rows.map((c) => (c.id === id ? { ...c, ...updated } : c)),
+      );
+      if (id === conversationId) setConversationTitle(updated.title);
+      setSessionError("");
+    } catch (err) {
+      setSessionError(err.message || "改名失败");
+    }
+  };
+
+  const onPickAttachment = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    const lower = (file.name || "").toLowerCase();
+    if (!lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
+      setSessionError("仅支持 Excel（.xlsx）附件");
+      return;
+    }
+    setAttachBusy(true);
+    setSessionError("");
+    try {
+      const meta = await uploadChatAttachment(file);
+      setAttachment(meta);
+    } catch (err) {
+      setSessionError(err.message || "附件上传失败");
+    } finally {
+      setAttachBusy(false);
+    }
+  };
+
+  const runToolAction = async (action, payload = {}) => {
+    if (!conversationId || loading) return;
+    setLoading(true);
+    try {
+      await chatToolAction({ conversationId, action, payload });
+      setMessages(await getMessages(conversationId));
+    } catch (err) {
+      setSessionError(err.message || "工具动作失败");
+    } finally {
+      setLoading(false);
+    }
   };
 
   const send = async (rawText) => {
     const text = (rawText ?? input).trim();
-    if (!text || loading) return;
+    if ((!text && !attachment) || loading) return;
+    const outbound = text || (attachment ? `请处理附件 ${attachment.filename}` : "");
     setInput("");
     setLoading(true);
+    setSessionError("");
 
     let currentId = conversationId;
     let currentTitle = conversationTitle;
+    const attachMeta = attachment;
     const optimisticMessages = [
       ...messages,
-      { role: "user", content: text },
+      {
+        role: "user",
+        content: attachMeta ? `${outbound}\n[附件] ${attachMeta.filename}` : outbound,
+      },
       { role: "assistant", content: "", streaming: true },
     ];
     setMessages(optimisticMessages);
+    setAttachment(null);
 
     let assembled = "";
     try {
       await streamChat({
-        message: text,
+        message: outbound,
         conversationId: currentId,
+        activeTool: activeTool,
+        attachmentId: attachMeta?.id || null,
         onStart: (data) => {
           currentId = data.conversation_id;
+          applyConversationId(currentId);
         },
         onToken: (token) => {
           assembled += token;
@@ -115,23 +464,45 @@ export default function ChatPage() {
         onDone: (data) => {
           currentId = data.conversation_id;
           assembled = data.answer || assembled;
+          setMessages([
+            ...optimisticMessages.slice(0, -1),
+            {
+              role: "assistant",
+              content: assembled,
+              id: data.message_id,
+              meta: data.card ? { tool: "staffing", card: data.card } : undefined,
+              citations: data.citations || [],
+            },
+          ]);
         },
         onError: (error) => {
-          assembled += `\n[错误] ${error}`;
+          assembled += `\n[错误] ${typeof error === "string" ? error : error?.message || error}`;
+          setSessionError(assembled.includes("[错误]") ? assembled.replace(/^\n?\[错误\]\s*/, "") : "对话失败");
         },
       });
     } catch (error) {
       assembled += `\n[错误] ${error.message}`;
+      setSessionError(error.message || "对话失败");
+      if (error.status === 404) {
+        setSessionError("会话不存在或无权限，请新建对话。");
+        applyConversationId(null);
+      }
     }
 
-    setConversationId(currentId);
+    applyConversationId(currentId);
     setLoading(false);
     const rows = await refreshConversations();
     const active = rows.find((item) => item.id === currentId);
     if (active) currentTitle = active.title;
     setConversationTitle(currentTitle);
     if (currentId) {
-      setMessages(await getMessages(currentId));
+      try {
+        setMessages(await getMessages(currentId));
+        await loadMemory(currentId);
+      } catch (err) {
+        // Keep streamed content if reload fails
+        if (!assembled) setSessionError(err.message || "加载消息失败");
+      }
     }
   };
 
@@ -161,28 +532,80 @@ export default function ChatPage() {
         </button>
 
         <div className="side-section">最近</div>
+        {memory?.content && (
+          <div className="session-memory" aria-label="会话记忆">
+            <div className="session-memory-title">会话记忆（压缩摘要）</div>
+            <p className="session-memory-body">{memory.content}</p>
+            <div className="session-memory-hint">只读 · 完整原文见下方消息</div>
+          </div>
+        )}
+        {sessionError && <div className="session-error">{sessionError}</div>}
         <div className="conversation-list">
           {conversations.length === 0 && (
             <div className="conversation-empty">还没有历史会话</div>
           )}
           {conversations.map((conversation) => (
-            <button
+            <div
               key={conversation.id}
               className={`conversation-item ${conversation.id === conversationId ? "active" : ""}`}
-              onClick={() => openConversation(conversation)}
-              title={conversation.title || "新对话"}
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-                <path
-                  d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+              {editingTitleId === conversation.id ? (
+                <input
+                  className="conversation-title-input"
+                  value={editingTitleDraft}
+                  autoFocus
+                  onChange={(e) => setEditingTitleDraft(e.target.value)}
+                  onBlur={() => {
+                    window.setTimeout(() => {
+                      if (editingTitleIdRef.current === conversation.id) commitRename();
+                    }, 120);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      commitRename();
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      cancelRename();
+                    }
+                  }}
+                  onClick={(e) => e.stopPropagation()}
                 />
-              </svg>
-              <span>{conversation.title || "新对话"}</span>
-            </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="conversation-item-btn"
+                    onClick={() => openConversation(conversation)}
+                    title={conversation.title || "新对话"}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+                      <path
+                        d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                    <span>{conversation.title || "新对话"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="conversation-rename-btn"
+                    title="改名"
+                    aria-label="改名"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      beginRename(conversation);
+                    }}
+                  >
+                    改名
+                  </button>
+                </>
+              )}
+            </div>
           ))}
         </div>
 
@@ -206,7 +629,42 @@ export default function ChatPage() {
       <main className="chat-main">
         {conversationId && (
           <header className="chat-header">
-            <span className="chat-title">{conversationTitle || "新对话"}</span>
+            {editingTitleId === conversationId ? (
+              <input
+                className="chat-title-input"
+                value={editingTitleDraft}
+                autoFocus
+                onChange={(e) => setEditingTitleDraft(e.target.value)}
+                onBlur={() => {
+                  window.setTimeout(() => {
+                    if (editingTitleIdRef.current === conversationId) commitRename();
+                  }, 120);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitRename();
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    cancelRename();
+                  }
+                }}
+              />
+            ) : (
+              <div className="chat-title-row">
+                <span className="chat-title">{conversationTitle || "新对话"}</span>
+                <button
+                  type="button"
+                  className="chat-rename-btn"
+                  onClick={() =>
+                    beginRename({ id: conversationId, title: conversationTitle })
+                  }
+                >
+                  改名
+                </button>
+              </div>
+            )}
           </header>
         )}
 
@@ -239,6 +697,32 @@ export default function ChatPage() {
                     {message.role === "assistant" ? (
                       <>
                         <RichText text={message.content || (message.streaming ? "正在思考…" : "")} />
+                        {message.meta?.card?.type === "staffing_batch" ? (
+                          <StaffingBatchCard
+                            card={message.meta.card}
+                            disabled={loading}
+                            onConfirm={(action, payload) => runToolAction(action, payload)}
+                          />
+                        ) : null}
+                        {message.meta?.card?.type === "staffing_summary" ? (
+                          <div className="tool-card">
+                            <StaffingSummaryPanel
+                              summary={message.meta.card}
+                              compact
+                              onExport={
+                                message.meta.card.project_id
+                                  ? async () => {
+                                      try {
+                                        await exportStaffingXlsx(message.meta.card.project_id);
+                                      } catch (err) {
+                                        setSessionError(err.message || "导出失败");
+                                      }
+                                    }
+                                  : undefined
+                              }
+                            />
+                          </div>
+                        ) : null}
                         {message.citations?.length > 0 && (
                           <div className="citations">
                             {message.citations.map((citation) => (
@@ -309,12 +793,21 @@ export default function ChatPage() {
         )}
 
         <footer className="composer-wrap">
+          {sessionError ? <div className="composer-error">{sessionError}</div> : null}
+          {attachment ? (
+            <div className="composer-attach-chip">
+              已附加：{attachment.filename}
+              <button type="button" onClick={() => setAttachment(null)}>
+                移除
+              </button>
+            </div>
+          ) : null}
           <div className="composer">
             <textarea
               ref={textareaRef}
               rows={1}
               value={input}
-              placeholder="问点想问的，Enter 发送，Shift + Enter 换行"
+              placeholder="问点想问的，或附上项目日报让我帮你做人员投入…"
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
@@ -323,23 +816,99 @@ export default function ChatPage() {
                 }
               }}
             />
-            <button className="send" onClick={() => send()} disabled={!input.trim() || loading} title="发送">
-              {loading ? (
-                <span className="spinner" />
-              ) : (
+            <div className="composer-tools">
+              <label className="composer-icon-btn" title="上传 Excel（.xlsx）" aria-label="上传 Excel">
+                <input
+                  type="file"
+                  accept=".xlsx,.xls"
+                  hidden
+                  disabled={attachBusy || loading}
+                  onChange={onPickAttachment}
+                />
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
                   <path
-                    d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"
+                    d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"
                     stroke="currentColor"
                     strokeWidth="2"
                     strokeLinecap="round"
                     strokeLinejoin="round"
                   />
                 </svg>
-              )}
-            </button>
+              </label>
+              {tools.length ? (
+                <div className="tool-menu">
+                  <button
+                    type="button"
+                    className={`composer-icon-btn${activeTool ? " active" : ""}`}
+                    title="选择工具"
+                    onClick={() => setToolMenuOpen((v) => !v)}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+                      <path
+                        d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </button>
+                  {toolMenuOpen ? (
+                    <div className="tool-menu-dropdown">
+                      <button
+                        type="button"
+                        className={!activeTool ? "selected" : ""}
+                        onClick={() => {
+                          setActiveTool("");
+                          setToolMenuOpen(false);
+                        }}
+                      >
+                        不使用工具
+                      </button>
+                      {tools.map((t) => (
+                        <button
+                          key={t.id}
+                          type="button"
+                          className={activeTool === t.id ? "selected" : ""}
+                          onClick={() => {
+                            setActiveTool(t.id);
+                            setToolMenuOpen(false);
+                          }}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              <button
+                className="send"
+                onClick={() => send()}
+                disabled={(!input.trim() && !attachment) || loading}
+                title="发送"
+              >
+                {loading ? (
+                  <span className="spinner" />
+                ) : (
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+                    <path
+                      d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                )}
+              </button>
+            </div>
           </div>
-          <div className="composer-hint">回答基于已上传文档生成，请核对引用来源</div>
+          <div className="composer-hint">
+            {activeTool
+              ? `当前工具：${tools.find((t) => t.id === activeTool)?.label || activeTool}`
+              : "回答基于已上传文档；也可选工具或附上项目日报做人员投入"}
+          </div>
         </footer>
       </main>
       {lightbox && lightbox.images[lightbox.index] && (

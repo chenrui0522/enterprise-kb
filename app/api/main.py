@@ -17,10 +17,12 @@ from app.core.errors import AppError
 from app.core.logging import get_logger, setup_logging
 from app.core.middleware import RequestContextMiddleware
 from app.core.redis import close_redis, get_redis
+from app.identity.bootstrap import ensure_permissions_and_roles
+from app.identity.constants import DEFAULT_TENANT_ID
 from app.providers.factory import build_embedder, build_llm, build_reranker
 from app.retrieval.milvus_store import MilvusStore
 from app.retrieval.service import SearchService
-from app.api.routers import auth, chat, documents, org, system
+from app.api.routers import auth, chat, documents, org, staffing, system
 
 logger = get_logger("api")
 
@@ -34,6 +36,19 @@ if sys.platform == "win32":
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     await create_tables_if_needed()
+
+    tenant_id = settings.default_tenant_id or DEFAULT_TENANT_ID
+    try:
+        factory = get_session_factory()
+        async with factory() as session:
+            await ensure_permissions_and_roles(session, tenant_id)
+            await session.commit()
+        logger.info("identity permission catalog synced for tenant=%s", tenant_id)
+    except Exception:
+        logger.warning(
+            "identity permission catalog sync failed; roles may be stale until seed/create-admin",
+            exc_info=settings.debug,
+        )
 
     store = MilvusStore(settings)
     try:
@@ -120,6 +135,7 @@ def create_app() -> FastAPI:
     app.include_router(org.router, prefix="/api/v1")
     app.include_router(chat.router, prefix="/api/v1")
     app.include_router(documents.router, prefix="/api/v1")
+    app.include_router(staffing.router, prefix="/api/v1")
     return app
 
 

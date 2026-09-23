@@ -62,6 +62,21 @@ def _last_exchanges(history: list[dict], turns: int) -> list[dict]:
     return tail
 
 
+def _history_transcript(state: ChatState, turns: int) -> str:
+    parts: list[str] = []
+    summary = (state.get("memory_summary") or "").strip()
+    if summary:
+        parts.append(f"【会话记忆摘要】\n{summary}")
+    history = _last_exchanges(state.get("history") or [], turns)
+    if history:
+        transcript = "\n".join(
+            f"{'用户' if message['role'] == 'user' else '助手'}: {message['content']}"
+            for message in history
+        )
+        parts.append(f"【最近对话】\n{transcript}")
+    return "\n\n".join(parts)
+
+
 class ChatGraph:
     def __init__(
         self,
@@ -113,16 +128,13 @@ class ChatGraph:
                 meta["skipped"] = "greeting"
                 return {"rewritten_query": question}
             history = _last_exchanges(state["history"], self._history_turns)
-            if not history:
+            if not history and not (state.get("memory_summary") or "").strip():
                 meta["skipped"] = "no_history"
                 return {"rewritten_query": question}
-            transcript = "\n".join(
-                f"{'用户' if message['role'] == 'user' else '助手'}: {message['content']}"
-                for message in history[-6:]
-            )
+            context = _history_transcript(state, self._history_turns)
             payload = await self._llm.complete_json(
                 system=REWRITE_SYSTEM,
-                user=f"【最近对话】\n{transcript}\n\n【用户最新问题】\n{question}",
+                user=f"{context}\n\n【用户最新问题】\n{question}",
                 temperature=0.1,
             )
             rewritten = str(payload.get("rewritten_query") or question).strip()
@@ -135,14 +147,10 @@ class ChatGraph:
             if normalized in {item.strip().lower() for item in GREETINGS}:
                 meta["need_retrieval"] = False
                 return {"need_retrieval": False}
-            history = _last_exchanges(state["history"], self._history_turns)
-            transcript = "\n".join(
-                f"{'用户' if message['role'] == 'user' else '助手'}: {message['content']}"
-                for message in history[-6:]
-            )
+            context = _history_transcript(state, self._history_turns)
             payload = await self._llm.complete_json(
                 system=JUDGE_SYSTEM,
-                user=f"【最近对话】\n{transcript}\n\n【用户最新问题】\n{question}",
+                user=f"{context}\n\n【用户最新问题】\n{question}",
                 temperature=0.0,
             )
             need = bool(payload.get("need_retrieval", True))

@@ -19,10 +19,17 @@ import {
   updateUserClearance,
 } from "../api.js";
 import { useAuth } from "../auth.jsx";
+import {
+  CLEARANCE_OPTIONS,
+  ORG_TYPE_OPTIONS,
+  SITE_OPTIONS,
+  clearanceLabel,
+  orderOrgUnitsTree,
+  orgOptionLabel,
+  orgTypeLabel,
+  siteLabel,
+} from "../identityLabels.js";
 
-const ORG_TYPES = ["company", "office", "center", "dept", "committee"];
-const SITES = ["taiyuan", "shuozhou", "suzhou"];
-const CLEARANCES = ["general", "core"];
 const DOMAINS = [
   "software",
   "electrical",
@@ -121,7 +128,9 @@ export default function AdminPage() {
     <main className="admin-page">
       <header className="admin-hero">
         <h1>组织与权限管理</h1>
-        <p className="muted">组织树、岗位、绑岗密级、项目授权与审计查阅</p>
+        <p className="muted">
+          组织树对齐企业微信通讯录（总经理办 + 八中心 + 泰国公司及下属部/组）。太原/朔州/苏州是人身上的地点，不是组织层；岗位视野仅本级。
+        </p>
       </header>
 
       <nav className="admin-tabs">
@@ -310,6 +319,7 @@ function OrgPanel({ orgUnits, onDone, onError }) {
     parent_id: "",
     default_site: "",
   });
+  const tree = useMemo(() => orderOrgUnitsTree(orgUnits), [orgUnits]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -329,77 +339,80 @@ function OrgPanel({ orgUnits, onDone, onError }) {
   };
 
   return (
-    <section className="admin-grid">
-      <form className="admin-card" onSubmit={submit}>
-        <h2>新建组织节点</h2>
-        <Field label="编码" required>
-          <input
-            value={form.code}
-            onChange={(e) => setForm({ ...form, code: e.target.value })}
-            required
-          />
-        </Field>
-        <Field label="名称" required>
-          <input
-            value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
-            required
-          />
-        </Field>
-        <Field label="类型" required>
-          <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}>
-            {ORG_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="父节点">
-          <select
-            value={form.parent_id}
-            onChange={(e) => setForm({ ...form, parent_id: e.target.value })}
-          >
-            <option value="">（根节点）</option>
-            {orgUnits.map((u) => (
-              <option key={u.id} value={u.id}>
-                {u.code} · {u.name}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="默认地点">
-          <select
-            value={form.default_site}
-            onChange={(e) => setForm({ ...form, default_site: e.target.value })}
-          >
-            <option value="">（无）</option>
-            {SITES.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <button type="submit">创建</button>
-      </form>
+    <section className="admin-stack">
+      <p className="admin-hint muted">
+        种子含通讯录全量文件夹。☆太原/朔州/苏州公司仅作地点标签，不建节点；「泰国公司」为公司直属部门。挂在组上的岗位默认看不到上级部门资料。
+      </p>
+      <div className="admin-grid">
+        <form className="admin-card" onSubmit={submit}>
+          <h2>新建组织节点</h2>
+          <Field label="编码" required>
+            <input
+              value={form.code}
+              onChange={(e) => setForm({ ...form, code: e.target.value })}
+              required
+            />
+          </Field>
+          <Field label="名称" required>
+            <input
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              required
+            />
+          </Field>
+          <Field label="类型" required>
+            <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}>
+              {ORG_TYPE_OPTIONS.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}（{t.value}）
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="父节点">
+            <select
+              value={form.parent_id}
+              onChange={(e) => setForm({ ...form, parent_id: e.target.value })}
+            >
+              <option value="">（根节点）</option>
+              {tree.map(({ unit, depth }) => (
+                <option key={unit.id} value={unit.id}>
+                  {orgOptionLabel(unit, depth)}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="默认地点（可选，不等于☆公司）">
+            <select
+              value={form.default_site}
+              onChange={(e) => setForm({ ...form, default_site: e.target.value })}
+            >
+              <option value="">（无）</option>
+              {SITE_OPTIONS.map((s) => (
+                <option key={s.value} value={s.value}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <button type="submit">创建</button>
+        </form>
 
-      <div className="admin-card">
-        <h2>组织列表（{orgUnits.length}）</h2>
-        <ul className="admin-list">
-          {orgUnits.map((u) => (
-            <li key={u.id}>
-              <strong>{u.name}</strong>
-              <span className="muted">
-                {" "}
-                {u.code} · {u.type}
-                {u.parent_id
-                  ? ` · 父 ${orgUnits.find((p) => p.id === u.parent_id)?.code || u.parent_id.slice(0, 8)}`
-                  : " · 根"}
-              </span>
-            </li>
-          ))}
-        </ul>
+        <div className="admin-card">
+          <h2>组织树（{orgUnits.length}）</h2>
+          <ul className="admin-list admin-org-tree">
+            {tree.map(({ unit, depth }) => (
+              <li key={unit.id} style={{ paddingLeft: `${depth * 14}px` }}>
+                <strong>{unit.name}</strong>
+                <span className="muted">
+                  {" "}
+                  {unit.code} · {orgTypeLabel(unit.type)}
+                  {unit.default_site ? ` · 默认地点 ${siteLabel(unit.default_site)}` : ""}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       </div>
     </section>
   );
@@ -446,6 +459,7 @@ function PositionsPanel({ orgUnits, positions, onDone, onError }) {
   };
 
   const orgName = (id) => orgUnits.find((u) => u.id === id)?.name || id.slice(0, 8);
+  const orgTree = useMemo(() => orderOrgUnitsTree(orgUnits), [orgUnits]);
 
   return (
     <section className="admin-grid">
@@ -472,9 +486,9 @@ function PositionsPanel({ orgUnits, positions, onDone, onError }) {
             required
           >
             <option value="">请选择</option>
-            {orgUnits.map((u) => (
-              <option key={u.id} value={u.id}>
-                {u.code} · {u.name}
+            {orgTree.map(({ unit, depth }) => (
+              <option key={unit.id} value={unit.id}>
+                {orgOptionLabel(unit, depth)}
               </option>
             ))}
           </select>
@@ -553,6 +567,7 @@ function UsersPanel({ orgUnits, positions, users, onDone, onError }) {
     () => users.find((u) => u.id === unbindForm.user_id),
     [users, unbindForm.user_id],
   );
+  const orgTree = useMemo(() => orderOrgUnitsTree(orgUnits), [orgUnits]);
   const boundPositions = useMemo(() => {
     const ids = new Set(selectedUnbindUser?.position_ids || []);
     return positions.filter((p) => ids.has(p.id));
@@ -655,7 +670,7 @@ function UsersPanel({ orgUnits, positions, users, onDone, onError }) {
               <strong>{u.display_name || u.username}</strong>
               <span className="muted">
                 {" "}
-                @{u.username} · {u.site} · 密级 {u.clearance}
+                @{u.username} · {siteLabel(u.site)} · 密级 {clearanceLabel(u.clearance)}
                 {u.position_ids?.length
                   ? ` · 岗 ${u.position_ids.map(posLabel).join(" / ")}`
                   : " · 无岗"}
@@ -690,14 +705,14 @@ function UsersPanel({ orgUnits, positions, users, onDone, onError }) {
               onChange={(e) => setCreateForm({ ...createForm, display_name: e.target.value })}
             />
           </Field>
-          <Field label="地点" required>
+          <Field label="地点（太原/朔州/苏州，非组织节点）" required>
             <select
               value={createForm.site}
               onChange={(e) => setCreateForm({ ...createForm, site: e.target.value })}
             >
-              {SITES.map((s) => (
-                <option key={s} value={s}>
-                  {s}
+              {SITE_OPTIONS.map((s) => (
+                <option key={s.value} value={s.value}>
+                  {s.label}
                 </option>
               ))}
             </select>
@@ -708,9 +723,9 @@ function UsersPanel({ orgUnits, positions, users, onDone, onError }) {
               onChange={(e) => setCreateForm({ ...createForm, clearance: e.target.value })}
               required
             >
-              {CLEARANCES.map((c) => (
-                <option key={c} value={c}>
-                  {c}
+              {CLEARANCE_OPTIONS.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.label}
                 </option>
               ))}
             </select>
@@ -755,9 +770,9 @@ function UsersPanel({ orgUnits, positions, users, onDone, onError }) {
               required
             >
               <option value="">请选择密级</option>
-              {CLEARANCES.map((c) => (
-                <option key={c} value={c}>
-                  {c}
+              {CLEARANCE_OPTIONS.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.label}
                 </option>
               ))}
             </select>
@@ -806,9 +821,9 @@ function UsersPanel({ orgUnits, positions, users, onDone, onError }) {
               required
             >
               <option value="">请选择密级</option>
-              {CLEARANCES.map((c) => (
-                <option key={c} value={c}>
-                  {c}
+              {CLEARANCE_OPTIONS.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.label}
                 </option>
               ))}
             </select>
@@ -841,9 +856,9 @@ function UsersPanel({ orgUnits, positions, users, onDone, onError }) {
               required
             >
               <option value="">请选择密级</option>
-              {CLEARANCES.map((c) => (
-                <option key={c} value={c}>
-                  {c}
+              {CLEARANCE_OPTIONS.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.label}
                 </option>
               ))}
             </select>
@@ -876,9 +891,9 @@ function UsersPanel({ orgUnits, positions, users, onDone, onError }) {
               required
             >
               <option value="">请选择</option>
-              {orgUnits.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.code} · {u.name}
+              {orgTree.map(({ unit, depth }) => (
+                <option key={unit.id} value={unit.id}>
+                  {orgOptionLabel(unit, depth)}
                 </option>
               ))}
             </select>

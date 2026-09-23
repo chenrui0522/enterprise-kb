@@ -6,6 +6,8 @@
 
 - 知识问答：混合检索（向量 + BM25）→ 重排 → 带引用（文档名 + 页码）生成回答；无依据时拒绝猜测。
 - 多轮对话：追问改写、检索必要性判定、会话持久化、SSE 流式输出。
+- 会话标题：新建默认为「新对话」；首条用户消息（或附件名）规则命名后异步模型润色；侧栏/顶栏双击可手改（`PATCH /conversations/{id}`）；手改后自动命名不再覆盖。存量可用 `uv run python -m app.cli backfill-conversation-titles`。
+- 会话记忆：短期滑动窗口 + 长期滚动摘要；未压缩窗口超 `KB_MEMORY_TOKEN_BUDGET` 时异步压缩（worker），摘要受 `KB_SUMMARY_TOKEN_CAP` 硬顶；原文只标记不删除；聊天主界面只读展示「会话记忆」；L1 `memory.*` 日志 + L2 golden 探针支撑预算校准（人调 env，不自调节）。
 - 父子分块（`structure-v2`）：**小块检索、大块生成** —— Milvus 只存子块（与表格行/摘要、图片块），父块（标题子树）存 PostgreSQL，命中子块后按 `parent_id` 展开父块送生成，引用仍指向子块位置。
 - 文档接入：PDF / Word / PPT / Excel / Markdown / TXT / HTML / CSV / JSON / 图片(PNG/JPG) 先经**转换分诊**选择最合适的解析路径（本地 / Docling / MinerU / 表格语义化）→ 统一转为结构块与 Markdown → 切片 → bge-m3 向量化 → 写入 Milvus；PDF 保留页码定位，支持更新版本替换与失败重试，并记录**转换报告**（转换器、分诊依据、回退、耗时、表格/图片数）。
 - 扫描件 / 复杂彩页 OCR（可选）：接入本地 MinerU 服务后，图片与无文本层的扫描 PDF 自动走 OCR，复杂版式彩页手册可上传时强制 OCR（`ocr=true`）。
@@ -57,6 +59,8 @@ cd frontend
 npm install
 npm run dev                           # http://localhost:5173
 ```
+
+临时让外网同事试用（花生壳只穿 **5173**、勿穿 API/数据库）：见 [`docs/remote-demo-huashengke.md`](docs/remote-demo-huashengke.md)。
 
 首次启动会按 `KB_AUTO_CREATE_TABLES=true` 自动建表（生产环境建议关闭并用 Alembic）：
 
@@ -238,7 +242,7 @@ uv run python scripts/eval_conversion.py --samples data/conversion_eval --ocr   
 ### 切换与重导
 
 ```bash
-# .env：KB_CHUNKER_VERSION=structure-v2、KB_MILVUS_COLLECTION=kb_chunks_v4
+# .env：KB_CHUNKER_VERSION=structure-v2、KB_MILVUS_COLLECTION=kb_chunks_v5（含组织/项目可见性字段；旧集合无 ACL 字段时检索会跳过可见性过滤并打告警）
 uv run alembic upgrade head                                   # 新增 chunk_parents / document_tables
 uv run python -m app.reindex --dry-run                        # 先看清单
 uv run python -m app.reindex --wait --timeout 3600            # 全量重导（复用解析缓存）
@@ -260,7 +264,17 @@ uv run python -m app.reindex --wait --timeout 3600            # 全量重导（�
 - `GET /api/v1/documents`、`GET /api/v1/documents/{id}`、`GET /api/v1/documents/{id}/conversion-report`（转换报告）、`POST /api/v1/documents/{id}/retry`
 - `GET /api/v1/documents/{id}/tables`、`GET /api/v1/documents/{id}/tables/{table_id}`（表格元数据与整表行数据，供引用侧展示）
 - `POST /api/v1/chat/stream`：SSE 流式问答（`message` + 可选 `conversation_id`）
-- `POST /api/v1/conversations`、`GET /api/v1/conversations`、`GET /api/v1/conversations/{id}/messages`
+- `GET /api/v1/conversations/{id}/memory`：只读返回最新会话记忆摘要（无则 `null`）
+- `GET /api/v1/conversations/{id}/messages`：全量消息（含已压缩原文，`compressed` 标记）
+
+### 会话记忆（长期摘要）
+
+- **短期**：未压缩最近 `KB_HISTORY_TURNS` 轮进入改写/判定上下文。
+- **长期**：未压缩窗口合计 token（约 2 字/token）超过 `KB_MEMORY_TOKEN_BUDGET` 时，聊天路径只入队；worker 异步滚动摘要，受 `KB_SUMMARY_TOKEN_CAP` 硬顶。
+- **原文**：`compressed=true` 后仍可在消息历史查询；PostgreSQL 为唯一事实来源，清空 Redis 不影响恢复。
+- **前端**：URL `?c=` + `localStorage` 持久化会话；侧栏只读「会话记忆（压缩摘要）」。
+- **自观测**：L1 事件 `memory.budget_check` / `compress_enqueued` / `compress_done` / `compress_failed`；L2 见 `tests/test_conversation_memory.py`。预算默认值可按观测人调 env，不自动改参。
+- `POST /api/v1/conversations`、`GET /api/v1/conversations`、`PATCH /api/v1/conversations/{id}`（改标题）、`GET /api/v1/conversations/{id}/messages`
 - `POST /api/v1/feedback`：答案反馈占位
 - `GET /api/v1/audit/events`（需 `audit:read`；支持 `action` / `actor` / `since` / `until` / `offset` / `limit`）、`GET /healthz`
 
@@ -321,8 +335,8 @@ scripts/       init-models.sh 等
 - **OCR 与解析器**：`app/ingestion/triage.py` 负责分诊与路由（`plan_candidates`），`app/ingestion/mineru.py` / `app/ingestion/docling.py` 是两个独立解析服务的 HTTP 客户端，`app/ingestion/tabular.py` 做 XLSX 语义化，`app/ingestion/cache.py` 是内容寻址的解析缓存。调整路由只改 `triage.plan_candidates` 一处。旧文档解析失败后调用重试即走新解析。
 - **父子分块 / 表格两级处理**：`app/ingestion/parent_child.py`（父块打包、子块策略、表格行级与摘要），生成端展开在 `app/chat/parent_context.py`，元数据过滤表达式在 `app/retrieval/milvus_store.py:build_filter_expr`。
 - **换向量库 / 检索策略**：`app/retrieval/milvus_store.py` 是唯一直接触碰 Milvus 的地方。
-- **多租户 / 权限 / 审计 / 反馈**：全集团单一 `tenant_id`（默认 `autley`）；太原/朔州/苏州是人身上的地点。身份模型为组织树 + 一人多岗（`user_positions`）+ 角色权限串 + 编制 + 密级 + 项目授权。登录后每请求现算 Principal，文档列表与 Milvus 召回共用可见性公式（部门/编制本级过密级，或项目∩专业不过密级）。规划见 `openspec/changes/add-org-tree-and-access-control/`（取代未落地的 `add-auth-and-rbac` / `add-corpus-access-scope`）。引导：`uv run python -m app.cli create-admin --username ... --password ... --clearance general --org-code gm_office`；演示种子：`uv run python -m app.cli seed-demo`。
-- **LangSmith / trace**：模型 provider 与图节点中已留出埋点位；本期使用结构化日志，无需改接口即可后续接入。
+- **多租户 / 权限 / 审计 / 反馈**：全集团单一 `tenant_id`（默认 `autley`）；太原/朔州/苏州是人身上的地点（通讯录☆太原/朔州/苏州公司仅标签，不进 `org_units`）。身份模型为组织树 + 一人多岗（`user_positions`）+ 角色权限串 + 编制 + 密级 + 项目授权。组织树与企业微信通讯录文件夹一致：公司根下为总经理办 + 八中心 + 泰国公司（公司直属部门）及下属部/组；软件部/采购部挂在产品中心。岗位视野仍为本级（挂在组上不自动看上级部）。登录后每请求现算 Principal，文档列表与 Milvus 召回共用可见性公式（部门/编制本级过密级，或项目∩专业不过密级）。API 启动时会把代码里的 `ROLE_PERMISSIONS` 幂等同步进库（避免新增权限如 `staffing:*` 后旧库角色缺权）。规划见 `openspec/changes/archive/2026-09-20-add-org-tree-and-access-control/`；通讯录全量种子见 `openspec/changes/sync-org-units-from-address-book/`。引导：`uv run python -m app.cli create-admin --username ... --password ... --clearance general --org-code gm_office`；演示种子：`uv run python -m app.cli seed-demo`。
+- **人员投入（项目日报）**：上传标准 `.xlsx` 项目日报 → 解析内部员工（C 列【公司人员】+ 右侧「我司人员」姓名格；忽略外部【外包人员】）→ 脏数据人工复核（含**同名双身份**须裁定分列或合并）→ 确认后按项目按「姓名+身份」汇总有谁/在场天数，含区间、人天、身份小计、轻量图与 xlsx 导出。**工期段**由连续在场日历日自动派生（相邻日同属一段，断 ≥1 日则新开段；汇总/对话卡/导出展示进场次数与各段入出）。权限：`staffing:read` / `staffing:write`。前端导航「人员投入」保留；也可在问答工具下拉或附日报完成同一流程。变更见 `openspec/changes/add-staffing-daily-import/`、`add-chat-staffing-tool/`、`enrich-staffing-summary/`、`add-staffing-work-stints/`。- **LangSmith / trace**：模型 provider 与图节点中已留出埋点位；本期使用结构化日志，无需改接口即可后续接入。
 
 ## 测试
 

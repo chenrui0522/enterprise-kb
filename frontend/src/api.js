@@ -2,7 +2,7 @@ const API_BASE = "/api/v1";
 
 function handleUnauthorized(status) {
   if (status === 401 && !window.location.pathname.startsWith("/login")) {
-    window.location.assign = "/login";
+    window.location.assign("/login");
   }
 }
 
@@ -52,8 +52,19 @@ export async function createConversation() {
   return jsonFetch("/conversations", { method: "POST", body: JSON.stringify({}) });
 }
 
+export async function updateConversationTitle(conversationId, title) {
+  return jsonFetch(`/conversations/${conversationId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title }),
+  });
+}
+
 export async function getMessages(conversationId) {
   return jsonFetch(`/conversations/${conversationId}/messages`);
+}
+
+export async function getConversationMemory(conversationId) {
+  return jsonFetch(`/conversations/${conversationId}/memory`);
 }
 
 export async function listDocuments() {
@@ -96,12 +107,27 @@ export async function submitFeedback({ messageId, rating, comment }) {
   });
 }
 
-export async function streamChat({ message, conversationId, onStart, onToken, onDone, onError }) {
+export async function streamChat({
+  message,
+  conversationId,
+  activeTool,
+  attachmentId,
+  onStart,
+  onToken,
+  onDone,
+  onError,
+}) {
   const response = await fetch(`${API_BASE}/chat/stream`, {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, conversation_id: conversationId || null }),
+    body: JSON.stringify({
+      message,
+      conversation_id: conversationId || null,
+      // "" clears sticky tool; omit/null keeps prior conversation tool_state
+      active_tool: activeTool === undefined || activeTool === null ? null : activeTool,
+      attachment_id: attachmentId || null,
+    }),
   });
   if (!response.ok || !response.body) {
     handleUnauthorized(response.status);
@@ -110,6 +136,7 @@ export async function streamChat({ message, conversationId, onStart, onToken, on
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  let sawDone = false;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -125,9 +152,55 @@ export async function streamChat({ message, conversationId, onStart, onToken, on
       if (payload.event === "message_start") onStart?.(payload.data);
       else if (payload.event === "token") onToken?.(payload.data);
       else if (payload.event === "error") onError?.(payload.data);
-      else if (payload.event === "done") onDone?.(payload.data);
+      else if (payload.event === "done") {
+        sawDone = true;
+        onDone?.(payload.data);
+      }
     }
   }
+  if (!sawDone) {
+    throw new Error("对话中断，未收到完整回复，请重试");
+  }
+}
+
+export async function listChatTools() {
+  return jsonFetch("/chat/tools");
+}
+
+export async function uploadChatAttachment(file) {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${API_BASE}/chat/attachments`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    if (response.status === 404) {
+      detail = "附件接口不可用（请重启后端后再试）";
+    }
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return response.json();
+}
+
+export async function chatToolAction({ conversationId, action, payload }) {
+  return jsonFetch("/chat/tool-action", {
+    method: "POST",
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      action,
+      payload: payload || null,
+    }),
+  });
 }
 
 // ---- Admin: org / positions / users / projects ----
@@ -232,4 +305,92 @@ export async function listAuditEvents({
   if (since) params.set("since", since);
   if (until) params.set("until", until);
   return jsonFetch(`/audit/events?${params}`);
+}
+
+// ---- Staffing ----
+
+export async function listMyStaffingProjects() {
+  return jsonFetch("/staffing/my-projects");
+}
+
+export async function uploadStaffingImport(file) {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${API_BASE}/staffing/imports`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    err.status = response.status;
+    throw err;
+  }
+  return response.json();
+}
+
+export async function getStaffingImport(batchId) {
+  return jsonFetch(`/staffing/imports/${batchId}`);
+}
+
+export async function reviewStaffingImport(batchId, body) {
+  return jsonFetch(`/staffing/imports/${batchId}/review`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function confirmStaffingImport(batchId) {
+  return jsonFetch(`/staffing/imports/${batchId}/confirm`, { method: "POST", body: "{}" });
+}
+
+export async function getStaffingSummary(projectId) {
+  return jsonFetch(`/staffing/projects/${projectId}/summary`);
+}
+
+export async function exportStaffingXlsx(projectId) {
+  const response = await fetch(`${API_BASE}/staffing/projects/${projectId}/export.xlsx`, {
+    method: "GET",
+    credentials: "include",
+  });
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `staffing-${projectId}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function listStaffingFacts(projectId, includeVoided = false) {
+  const q = includeVoided ? "?include_voided=true" : "";
+  return jsonFetch(`/staffing/projects/${projectId}/facts${q}`);
+}
+
+export async function voidStaffing(projectId, body) {
+  return jsonFetch(`/staffing/projects/${projectId}/void`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }

@@ -67,15 +67,20 @@ def test_scrub_removes_password_and_cookie_from_fields():
         event="auth.probe",
         password="secret-password",
         cookie="session=abc",
+        access_token="tok-xyz",
+        window_tokens=250,
         username="alice",
     )
     payload = json.loads(stream.getvalue().strip().splitlines()[-1])
     assert payload["password"] == "***"
     assert payload["cookie"] == "***"
+    assert payload["access_token"] == "***"
+    assert payload["window_tokens"] == 250
     assert payload["username"] == "alice"
     dumped = json.dumps(payload)
     assert "secret-password" not in dumped
     assert "session=abc" not in dumped
+    assert "tok-xyz" not in dumped
 
 
 def test_preview_text_truncates(monkeypatch):
@@ -151,6 +156,58 @@ def test_healthz_shape(monkeypatch):
     assert body["status"] == "degraded"
     assert body["checks"]["milvus"] == "fail"
     assert body["checks"]["postgres"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_check_model_service_requires_launched_models(monkeypatch):
+    from app.api.routers import system as system_module
+
+    get_settings.cache_clear()
+    settings = get_settings()
+
+    class _Resp:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    class _Client:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, _url: str):
+            return _Resp(self._payload)
+
+    monkeypatch.setattr(
+        system_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client({"data": []}),
+    )
+    assert await system_module._check_model_service(2.0) == "fail"
+
+    monkeypatch.setattr(
+        system_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(
+            {
+                "data": [
+                    {"id": settings.embedder_model},
+                    {"id": settings.reranker_model},
+                ]
+            }
+        ),
+    )
+    assert await system_module._check_model_service(2.0) == "ok"
 
 
 def test_healthz_unavailable_when_postgres_down(monkeypatch):

@@ -1,5 +1,6 @@
 import { NavLink, Navigate, Outlet } from "react-router-dom";
 import { useAuth } from "./auth.jsx";
+import { clearanceLabel, siteLabel } from "./identityLabels.js";
 
 function ChatNavIcon() {
   return (
@@ -74,6 +75,7 @@ export default function App() {
     hasPermission("projects:manage");
   const canAudit = hasPermission("audit:read");
   const canDocs = hasPermission("documents:write") || hasPermission("documents:read");
+  const canStaffing = hasPermission("staffing:read") || hasPermission("staffing:write");
 
   return (
     <div className="app-shell">
@@ -82,7 +84,7 @@ export default function App() {
           <strong>{user.display_name || user.username}</strong>
           <span className="muted">
             {" "}
-            · {user.site} · 密级 {user.clearance}
+            · {siteLabel(user.site)} · 密级 {clearanceLabel(user.clearance)}
           </span>
         </div>
         <nav className="app-nav">
@@ -97,6 +99,15 @@ export default function App() {
             >
               <DocsNavIcon />
               文档
+            </NavLink>
+          ) : null}
+          {canStaffing ? (
+            <NavLink
+              to="/staffing"
+              className={({ isActive }) => `app-nav-item${isActive ? " active" : ""}`}
+            >
+              <DocsNavIcon />
+              人员投入
             </NavLink>
           ) : null}
           {canManage ? (

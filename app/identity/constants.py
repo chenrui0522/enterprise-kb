@@ -23,6 +23,8 @@ PERM_AUDIT_READ = "audit:read"
 PERM_USERS_MANAGE = "users:manage"
 PERM_ORGS_MANAGE = "orgs:manage"
 PERM_PROJECTS_MANAGE = "projects:manage"
+PERM_STAFFING_READ = "staffing:read"
+PERM_STAFFING_WRITE = "staffing:write"
 
 ALL_PERMISSIONS: tuple[str, ...] = (
     PERM_DOCUMENTS_READ,
@@ -32,12 +34,20 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     PERM_USERS_MANAGE,
     PERM_ORGS_MANAGE,
     PERM_PROJECTS_MANAGE,
+    PERM_STAFFING_READ,
+    PERM_STAFFING_WRITE,
 )
 
 ROLE_PERMISSIONS: dict[str, tuple[str, ...]] = {
     "admin": ALL_PERMISSIONS,
-    "editor": (PERM_DOCUMENTS_READ, PERM_DOCUMENTS_WRITE, PERM_CHAT_USE),
-    "reader": (PERM_DOCUMENTS_READ, PERM_CHAT_USE),
+    "editor": (
+        PERM_DOCUMENTS_READ,
+        PERM_DOCUMENTS_WRITE,
+        PERM_CHAT_USE,
+        PERM_STAFFING_READ,
+        PERM_STAFFING_WRITE,
+    ),
+    "reader": (PERM_DOCUMENTS_READ, PERM_CHAT_USE, PERM_STAFFING_READ),
     "auditor": (PERM_DOCUMENTS_READ, PERM_AUDIT_READ),
 }
 

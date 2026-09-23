@@ -170,6 +170,9 @@ class MilvusStore:
         if not rows:
             return 0
         result = self._client.upsert(collection_name=self._collection, data=rows)
+        # Stats/search can lag until flush; reindex --wait otherwise reports ready
+        # while the new collection still looks empty to callers.
+        self._client.flush(self._collection)
         return int(result.get("upsert_count", len(rows)))
 
     def delete_by_version(self, version_id: str) -> None:
@@ -194,7 +197,21 @@ class MilvusStore:
         into RRF would rank "符合条件" as if it were "相关".
         """
         self.ensure_collection()
-        expr = build_filter_expr(tenant_id, filters, visibility_expr=visibility_expr)
+        # Old collections (pre access-control schema) lack org_unit_id etc.;
+        # applying visibility_expr against them crashes Milvus. Skip until reindex.
+        if visibility_expr and not self._supports_access_fields():
+            logger.warning(
+                "Milvus collection %s missing access fields; skipping visibility filter. "
+                "Recreate collection (new KB_MILVUS_COLLECTION) and reindex.",
+                self._collection,
+            )
+            visibility_expr = None
+        safe_filters = filters
+        if filters and not self._supports_access_fields():
+            safe_filters = {
+                key: value for key, value in filters.items() if key not in ACCESS_FIELDS
+            }
+        expr = build_filter_expr(tenant_id, safe_filters, visibility_expr=visibility_expr)
         dense_req = AnnSearchRequest(
             data=[query_vector],
             anns_field="dense",

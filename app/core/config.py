@@ -73,6 +73,14 @@ class Settings(BaseSettings):
     embed_batch_size: int = 32
     history_turns: int = 5
 
+    # Conversation memory (uncompressed window budget = definition A)
+    # Placeholders ~10 turns x estimated length; tune via env before acceptance.
+    memory_token_budget: int = 7000
+    summary_token_cap: int = 700
+    memory_queue_key: str = "kb:memory:compress"
+    memory_queue_processing_key: str = "kb:memory:compress:processing"
+    memory_compress_lock_prefix: str = "kb:memory:lock:"
+
     # Parent-child chunking (chunker_version=structure-v2). Parent size is the
     # generation-side context; child size/overlap stay the retrieval geometry.
     parent_child_enabled: bool = True

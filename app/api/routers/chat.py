@@ -3,23 +3,49 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.events import sse_event
 from app.chat.graph import ChatGraph
+from app.chat.memory.compress import maybe_enqueue_compress_for_conversation
+from app.chat.memory.context import build_chat_context
 from app.chat.service import (
     create_conversation,
     get_conversation,
+    get_latest_conversation_summary,
     list_conversations,
     list_messages,
     save_assistant_turn,
     save_feedback,
     save_user_message,
+    update_conversation_title,
     write_audit,
 )
+from app.chat.title import (
+    TITLE_SOURCE_AUTO,
+    TITLE_SOURCE_USER,
+    apply_rule_title_if_default,
+    derive_rule_title,
+    maybe_enqueue_title_polish,
+)
+from app.chat.tools.attachments import load_attachment, save_chat_xlsx
+from app.chat.tools.registry import WEAK_CLARIFY_COPY, list_tools_for_principal
+from app.chat.tools.router import (
+    route_turn,
+    user_affirms_staffing,
+    user_declines_staffing,
+)
+from app.chat.tools.staffing_orchestrator import (
+    apply_tool_action,
+    clear_tool_state,
+    handle_staffing_message,
+    set_tool_state,
+    update_staffing_state,
+)
+from app.core.config import get_settings
 from app.core.db import get_db_session, get_session_factory
 from app.core.errors import AppError
 from app.core.logging import bind_context, get_log_context, get_logger, log_event, logging_context, preview_text
@@ -30,13 +56,19 @@ from app.identity.deps import require_permission, tenant_from_principal
 from app.identity.principal import Principal
 from app.models.entity import DocumentImage, DocumentTable, Message
 from app.schemas.chat import (
+    ChatAttachmentOut,
     ChatRequest,
+    ChatToolOut,
     CitationImageOut,
     CitationOut,
     ConversationCreate,
+    ConversationMemoryOut,
     ConversationOut,
+    ConversationUpdate,
     FeedbackIn,
     MessageOut,
+    ToolActionIn,
+    ToolActionOut,
 )
 
 logger = get_logger("api.chat")
@@ -185,10 +217,30 @@ async def create_conversation_endpoint(
     tenant_id: str = Depends(tenant_from_principal),
     principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
 ) -> ConversationOut:
+    custom = (payload.title if payload else None) or None
     conversation = await create_conversation(
         session,
         tenant_id,
-        title=payload.title if payload else None,
+        title=custom,
+        created_by=principal.user_id,
+        title_source=TITLE_SOURCE_USER if custom else None,
+    )
+    return ConversationOut.model_validate(conversation)
+
+
+@router.patch("/conversations/{conversation_id}", response_model=ConversationOut)
+async def update_conversation_endpoint(
+    conversation_id: str,
+    payload: ConversationUpdate,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
+) -> ConversationOut:
+    conversation = await update_conversation_title(
+        session,
+        tenant_id,
+        conversation_id,
+        payload.title,
         created_by=principal.user_id,
     )
     return ConversationOut.model_validate(conversation)
@@ -204,6 +256,70 @@ async def conversations_endpoint(
     return [ConversationOut.model_validate(item) for item in conversations]
 
 
+@router.get("/chat/tools", response_model=list[ChatToolOut])
+async def chat_tools_endpoint(
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
+) -> list[ChatToolOut]:
+    return [ChatToolOut(**item) for item in list_tools_for_principal(principal)]
+
+
+@router.post("/chat/attachments", response_model=ChatAttachmentOut, status_code=201)
+async def chat_attachments_endpoint(
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
+) -> ChatAttachmentOut:
+    data = await file.read()
+    meta = save_chat_xlsx(
+        user_id=principal.user_id,
+        filename=file.filename or "upload.xlsx",
+        data=data,
+    )
+    return ChatAttachmentOut(
+        id=meta["id"], filename=meta["filename"], storage_key=meta["storage_key"]
+    )
+
+
+@router.post("/chat/tool-action", response_model=ToolActionOut)
+async def chat_tool_action_endpoint(
+    body: ToolActionIn,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
+) -> ToolActionOut:
+    conversation = await get_conversation(
+        session, tenant_id, body.conversation_id, created_by=principal.user_id
+    )
+    result = await apply_tool_action(
+        session,
+        principal=principal,
+        conversation=conversation,
+        action=body.action,
+        payload=body.payload,
+    )
+    await save_user_message(
+        session,
+        conversation.id,
+        tenant_id,
+        f"[工具动作] {body.action}",
+    )
+    meta = {"card": result.get("card")} if result.get("card") else None
+    await save_assistant_turn(
+        session,
+        conversation.id,
+        tenant_id,
+        result["content"],
+        rewritten_query=None,
+        citations=[],
+        meta=meta,
+    )
+    await session.commit()
+    return ToolActionOut(
+        content=result["content"],
+        card=result.get("card"),
+        conversation_id=conversation.id,
+    )
+
+
 @router.get("/conversations/{conversation_id}/messages", response_model=list[MessageOut])
 async def messages_endpoint(
     conversation_id: str,
@@ -211,7 +327,9 @@ async def messages_endpoint(
     tenant_id: str = Depends(tenant_from_principal),
     principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
 ) -> list[MessageOut]:
-    rows = await list_messages(session, tenant_id, conversation_id)
+    rows = await list_messages(
+        session, tenant_id, conversation_id, created_by=principal.user_id
+    )
     image_map = await _load_citation_images(
         session, tenant_id, [item.image_id for _, citations in rows for item in citations]
     )
@@ -223,6 +341,8 @@ async def messages_endpoint(
                 role=message.role,
                 content=message.content,
                 rewritten_query=message.rewritten_query,
+                compressed=bool(message.compressed),
+                meta=message.meta,
                 citations=[
                     CitationOut(
                         chunk_id=item.chunk_id,
@@ -240,6 +360,29 @@ async def messages_endpoint(
             )
         )
     return output
+
+
+@router.get("/conversations/{conversation_id}/memory", response_model=ConversationMemoryOut | None)
+async def conversation_memory_endpoint(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
+) -> ConversationMemoryOut | None:
+    summary = await get_latest_conversation_summary(
+        session, tenant_id, conversation_id, created_by=principal.user_id
+    )
+    if summary is None:
+        return None
+    return ConversationMemoryOut(
+        conversation_id=summary.conversation_id,
+        content=summary.content,
+        version=summary.version,
+        token_count=summary.token_count,
+        covered_from_message_id=summary.covered_from_message_id,
+        covered_to_message_id=summary.covered_to_message_id,
+        updated_at=summary.updated_at,
+    )
 
 
 @router.post("/chat/stream")
@@ -291,17 +434,34 @@ async def _chat_event_stream_inner(
 ) -> AsyncIterator[str]:
     session_factory = get_session_factory()
     try:
-        # Phase 1: short-lived session for conversation + user message.
+        # Phase 1: short-lived session for conversation + user message (+ tool route).
         async with session_factory() as session:
+            attachment = None
+            filename = None
+            if payload.attachment_id:
+                attachment = load_attachment(
+                    payload.attachment_id, user_id=principal.user_id
+                )
+                filename = attachment["filename"]
+
+            polish_title: str | None = None
             if payload.conversation_id:
                 conversation = await get_conversation(
                     session, tenant_id, payload.conversation_id, created_by=principal.user_id
                 )
             else:
+                rule = derive_rule_title(payload.message, filename)
                 conversation = await create_conversation(
-                    session, tenant_id, title=payload.message[:30],
+                    session,
+                    tenant_id,
+                    title=rule,
                     created_by=principal.user_id,
+                    title_source=TITLE_SOURCE_AUTO if rule != "新对话" else None,
                 )
+                clear_tool_state(conversation)
+                if conversation.title_source == TITLE_SOURCE_AUTO:
+                    polish_title = conversation.title
+
             conversation_id = conversation.id
             bind_context(conversation_id=conversation_id)
             log_event(
@@ -312,18 +472,163 @@ async def _chat_event_stream_inner(
             )
             yield sse_event({"event": "message_start", "data": {"conversation_id": conversation_id}})
 
-            rows = await list_messages(session, tenant_id, conversation_id)
-            history = [{"role": item.role, "content": item.content} for item, _ in rows]
+            # Auto-title: rule first when still default, then enqueue LLM polish.
+            new_title = apply_rule_title_if_default(
+                conversation, message=payload.message, filename=filename
+            )
+            if new_title:
+                await session.commit()
+                polish_title = new_title
+            if polish_title:
+                try:
+                    await maybe_enqueue_title_polish(
+                        get_redis(),
+                        conversation_id=conversation_id,
+                        tenant_id=tenant_id,
+                        rule_title=polish_title,
+                    )
+                except Exception:
+                    logger.warning("title polish enqueue failed", exc_info=True)
+
+            # Explicit tool selection updates conversation state; "" clears sticky tool.
+            if payload.active_tool:
+                update_staffing_state(conversation, active_tool=payload.active_tool)
+            elif payload.active_tool == "":
+                state = dict(conversation.tool_state or {})
+                state.pop("active_tool", None)
+                set_tool_state(conversation, state or None)
+
+            state = dict(conversation.tool_state or {})
+            pending_clarify = bool(state.get("pending_clarify"))
+            active_from_state = state.get("active_tool")
+            if payload.active_tool == "":
+                active_tool = None
+            elif payload.active_tool is not None:
+                active_tool = payload.active_tool
+            else:
+                active_tool = active_from_state
+
+            if pending_clarify and user_affirms_staffing(payload.message):
+                decision_kind = "staffing"
+                auto_note = "已确认使用人员投入。"
+                state.pop("pending_clarify", None)
+                set_tool_state(conversation, state)
+                update_staffing_state(conversation, active_tool="staffing")
+            elif pending_clarify and user_declines_staffing(payload.message):
+                decision_kind = "none"
+                auto_note = None
+                state.pop("pending_clarify", None)
+                set_tool_state(conversation, state)
+            else:
+                decision = route_turn(
+                    principal,
+                    active_tool=active_tool,
+                    message=payload.message,
+                    filename=filename,
+                )
+                decision_kind = decision.kind
+                auto_note = (
+                    "已按人员投入处理。" if decision.reason == "strong_rules" else None
+                )
+
+            settings = get_settings()
+            ctx = await build_chat_context(
+                session,
+                tenant_id,
+                conversation_id,
+                history_turns=settings.history_turns,
+            )
             user_message = await save_user_message(
                 session, conversation_id, tenant_id, payload.message
             )
+            await session.commit()
+
+            if decision_kind == "clarify":
+                content = WEAK_CLARIFY_COPY
+                state = dict(conversation.tool_state or {})
+                state["pending_clarify"] = True
+                set_tool_state(conversation, state)
+                assistant_message = await save_assistant_turn(
+                    session,
+                    conversation_id,
+                    tenant_id,
+                    content,
+                    rewritten_query=None,
+                    citations=[],
+                    meta={"tool": "staffing", "clarify": True},
+                )
+                await session.commit()
+                yield sse_event({"event": "token", "data": content})
+                yield sse_event(
+                    {
+                        "event": "done",
+                        "data": {
+                            "conversation_id": conversation_id,
+                            "message_id": assistant_message.id,
+                            "answer": content,
+                            "citations": [],
+                            "card": None,
+                            "error": None,
+                        },
+                    }
+                )
+                return
+
+            if decision_kind == "staffing":
+                try:
+                    result = await handle_staffing_message(
+                        session,
+                        principal=principal,
+                        conversation=conversation,
+                        message=payload.message,
+                        attachment=attachment,
+                        auto_note=auto_note,
+                    )
+                except AppError as exc:
+                    content = exc.message
+                    result = {"content": content, "card": None}
+                content = result["content"]
+                card = result.get("card")
+                meta = {"tool": "staffing", "card": card} if card else {"tool": "staffing"}
+                assistant_message = await save_assistant_turn(
+                    session,
+                    conversation_id,
+                    tenant_id,
+                    content,
+                    rewritten_query=None,
+                    citations=[],
+                    meta=meta,
+                )
+                await session.commit()
+                yield sse_event({"event": "token", "data": content})
+                yield sse_event(
+                    {
+                        "event": "done",
+                        "data": {
+                            "conversation_id": conversation_id,
+                            "message_id": assistant_message.id,
+                            "answer": content,
+                            "citations": [],
+                            "card": card,
+                            "error": None,
+                        },
+                    }
+                )
+                log_event(
+                    logger,
+                    "chat staffing done",
+                    event="chat.tool.staffing",
+                    ok=True,
+                )
+                return
 
         config = {"configurable": {"thread_id": conversation_id}}
         input_state = {
             "conversation_id": conversation_id,
             "tenant_id": tenant_id,
             "user_question": payload.message,
-            "history": history + [{"role": "user", "content": payload.message}],
+            "memory_summary": ctx.get("memory_summary") or "",
+            "history": list(ctx["history"]) + [{"role": "user", "content": payload.message}],
             "principal_scope": {
                 "user_id": principal.user_id,
                 "username": principal.username,
@@ -363,7 +668,12 @@ async def _chat_event_stream_inner(
             yield sse_event({"event": "error", "data": error_detail})
 
         values = last_state or {}
-        answer = values.get("answer") or "（未生成回答）"
+        answer = values.get("answer") or ""
+        if not answer:
+            if error_detail:
+                answer = f"回答生成失败：{error_detail}"
+            else:
+                answer = "（未生成回答）"
         citations = values.get("citations") or []
         rewritten_query = values.get("rewritten_query")
 
@@ -392,6 +702,15 @@ async def _chat_event_stream_inner(
                 detail={"user_message_id": user_message.id, "assistant_message_id": assistant_message.id},
                 actor=principal.username,
             )
+            try:
+                await maybe_enqueue_compress_for_conversation(
+                    session,
+                    get_redis(),
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                )
+            except Exception:
+                logger.exception("Failed to enqueue memory compress for %s", conversation_id)
         async with session_factory() as session:
             await _attach_citation_images(session, tenant_id, citations)
             await _attach_citation_tables(session, tenant_id, citations)
@@ -404,6 +723,7 @@ async def _chat_event_stream_inner(
                     "message_id": assistant_message.id,
                     "answer": answer,
                     "citations": citations,
+                    "card": None,
                     "error": error_detail,
                 },
             }

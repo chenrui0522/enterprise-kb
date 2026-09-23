@@ -3,10 +3,12 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.chat.memory.tokens import estimate_tokens
 from app.core.errors import NotFoundError
 from app.models.entity import (
     AuditEvent,
     Conversation,
+    ConversationSummary,
     FeedbackResponse,
     Message,
     MessageCitation,
@@ -19,11 +21,52 @@ async def create_conversation(
     title: str | None = None,
     *,
     created_by: str = "local-user",
+    title_source: str | None = None,
 ) -> Conversation:
+    from app.chat.title import DEFAULT_TITLE, TITLE_SOURCE_AUTO, TITLE_SOURCE_DEFAULT, TITLE_SOURCE_USER
+
+    resolved = (title or "").strip() or DEFAULT_TITLE
+    if title_source:
+        source = title_source
+    elif resolved == DEFAULT_TITLE:
+        source = TITLE_SOURCE_DEFAULT
+    else:
+        source = TITLE_SOURCE_AUTO
+    if source not in (TITLE_SOURCE_DEFAULT, TITLE_SOURCE_AUTO, TITLE_SOURCE_USER):
+        source = TITLE_SOURCE_DEFAULT
     conversation = Conversation(
-        tenant_id=tenant_id, title=title or "新对话", created_by=created_by
+        tenant_id=tenant_id,
+        title=resolved,
+        title_source=source,
+        created_by=created_by,
     )
     session.add(conversation)
+    await session.commit()
+    await session.refresh(conversation)
+    return conversation
+
+
+async def update_conversation_title(
+    session: AsyncSession,
+    tenant_id: str,
+    conversation_id: str,
+    title: str,
+    *,
+    created_by: str | None = None,
+) -> Conversation:
+    from app.chat.title import TITLE_SOURCE_USER
+    from app.core.errors import AppError
+
+    conversation = await get_conversation(
+        session, tenant_id, conversation_id, created_by=created_by
+    )
+    cleaned = (title or "").strip()
+    if not cleaned:
+        raise AppError("标题不能为空", status_code=400)
+    if len(cleaned) > 500:
+        cleaned = cleaned[:500]
+    conversation.title = cleaned
+    conversation.title_source = TITLE_SOURCE_USER
     await session.commit()
     await session.refresh(conversation)
     return conversation
@@ -59,9 +102,9 @@ async def get_conversation(
 
 
 async def list_messages(
-    session: AsyncSession, tenant_id: str, conversation_id: str
+    session: AsyncSession, tenant_id: str, conversation_id: str, *, created_by: str | None = None
 ) -> list[tuple[Message, list[MessageCitation]]]:
-    await get_conversation(session, tenant_id, conversation_id)
+    await get_conversation(session, tenant_id, conversation_id, created_by=created_by)
     result = await session.execute(
         select(Message)
         .where(
@@ -83,6 +126,22 @@ async def list_messages(
     return [(message, citations_by_message.get(message.id, [])) for message in messages]
 
 
+async def get_latest_conversation_summary(
+    session: AsyncSession, tenant_id: str, conversation_id: str, *, created_by: str | None = None
+) -> ConversationSummary | None:
+    await get_conversation(session, tenant_id, conversation_id, created_by=created_by)
+    result = await session.execute(
+        select(ConversationSummary)
+        .where(
+            ConversationSummary.tenant_id == tenant_id,
+            ConversationSummary.conversation_id == conversation_id,
+        )
+        .order_by(ConversationSummary.version.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def save_user_message(
     session: AsyncSession,
     conversation_id: str,
@@ -96,6 +155,8 @@ async def save_user_message(
         role="user",
         content=content,
         rewritten_query=rewritten_query,
+        compressed=False,
+        token_count=estimate_tokens(content),
     )
     session.add(message)
     await session.commit()
@@ -119,6 +180,8 @@ async def save_assistant_turn(
         content=content,
         rewritten_query=rewritten_query,
         meta=meta,
+        compressed=False,
+        token_count=estimate_tokens(content),
     )
     session.add(message)
     await session.flush()

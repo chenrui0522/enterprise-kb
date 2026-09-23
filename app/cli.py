@@ -10,105 +10,22 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.db import dispose_engine, get_session_factory
+from app.identity.bootstrap import ensure_permissions_and_roles
 from app.identity.constants import (
     DEFAULT_TENANT_ID,
     RELATION_ESTABLISHMENT,
-    ROLE_PERMISSIONS,
 )
+from app.identity.org_seed import seed_org_tree
 from app.identity.passwords import hash_password
 from app.models.entity import new_id
 from app.models.identity import (
-    OrgUnit,
-    Permission,
     Position,
     PositionRole,
     Project,
-    Role,
-    RolePermission,
     User,
     UserOrgRelation,
     UserPosition,
 )
-
-
-async def ensure_permissions_and_roles(session, tenant_id: str) -> dict[str, Role]:
-    for code, desc in {
-        "documents:read": "Read documents",
-        "documents:write": "Write documents",
-        "chat:use": "Chat",
-        "audit:read": "Audit",
-        "users:manage": "Users",
-        "orgs:manage": "Orgs",
-        "projects:manage": "Projects",
-    }.items():
-        if await session.get(Permission, code) is None:
-            session.add(Permission(code=code, description=desc))
-    await session.flush()
-    roles: dict[str, Role] = {}
-    for code, perms in ROLE_PERMISSIONS.items():
-        row = (
-            await session.execute(
-                select(Role).where(Role.tenant_id == tenant_id, Role.code == code)
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            row = Role(id=new_id(), tenant_id=tenant_id, code=code, name=code)
-            session.add(row)
-            await session.flush()
-        roles[code] = row
-        for perm in perms:
-            exists = (
-                await session.execute(
-                    select(RolePermission).where(
-                        RolePermission.role_id == row.id,
-                        RolePermission.permission_code == perm,
-                    )
-                )
-            ).scalar_one_or_none()
-            if exists is None:
-                session.add(RolePermission(id=new_id(), role_id=row.id, permission_code=perm))
-    await session.flush()
-    return roles
-
-
-async def seed_org_tree(session, tenant_id: str) -> dict[str, OrgUnit]:
-    """Minimal Autley tree for demos (codes are stable)."""
-    nodes = [
-        ("company", "autley", "奥特莱物流科技有限公司", None, None),
-        ("office", "gm_office", "总经办", "autley", None),
-        ("center", "product", "产品中心", "autley", None),
-        ("center", "production", "生产中心", "autley", "shuozhou"),
-        ("center", "rd", "研发中心", "autley", None),
-        ("center", "marketing", "营销中心", "autley", None),
-        ("dept", "software", "软件部", "production", "shuozhou"),
-        ("dept", "sales", "销售部", "marketing", None),
-        ("dept", "elec_std_rd", "电气标准化研发部", "rd", None),
-        ("dept", "procurement", "采购部", "production", "shuozhou"),
-    ]
-    by_code: dict[str, OrgUnit] = {}
-    for type_, code, name, parent_code, site in nodes:
-        existing = (
-            await session.execute(
-                select(OrgUnit).where(OrgUnit.tenant_id == tenant_id, OrgUnit.code == code)
-            )
-        ).scalar_one_or_none()
-        if existing:
-            by_code[code] = existing
-            continue
-        parent_id = by_code[parent_code].id if parent_code else None
-        unit = OrgUnit(
-            id=new_id(),
-            tenant_id=tenant_id,
-            parent_id=parent_id,
-            type=type_,
-            code=code,
-            name=name,
-            default_site=site,
-        )
-        session.add(unit)
-        await session.flush()
-        by_code[code] = unit
-    return by_code
 
 
 async def create_admin(
@@ -306,6 +223,12 @@ def main(argv: list[str] | None = None) -> None:
     admin.add_argument("--site", default="taiyuan")
 
     sub.add_parser("seed-demo", help="Seed Autley org tree + yuan/ma demo users")
+    backfill = sub.add_parser(
+        "backfill-conversation-titles",
+        help="Rule-title conversations still named 新对话 that already have user messages",
+    )
+    backfill.add_argument("--tenant-id", default=None)
+    backfill.add_argument("--limit", type=int, default=500)
 
     args = parser.parse_args(argv)
 
@@ -323,6 +246,15 @@ def main(argv: list[str] | None = None) -> None:
             elif args.cmd == "seed-demo":
                 await seed_demo()
                 print("demo seed complete (yuan/ma password=ChangeMe123!)")
+            elif args.cmd == "backfill-conversation-titles":
+                from app.chat.title import backfill_default_titles
+
+                factory = get_session_factory()
+                async with factory() as session:
+                    n = await backfill_default_titles(
+                        session, tenant_id=args.tenant_id, limit=args.limit
+                    )
+                print(f"backfilled {n} conversation title(s)")
         finally:
             await dispose_engine()
 

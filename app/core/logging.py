@@ -87,14 +87,27 @@ def preview_text(text: str | None, *, limit: int | None = None) -> str:
     return f"{text[:max_chars]}…<len={len(text)}>"
 
 
+def _is_sensitive_key(key: str) -> bool:
+    lower = key.lower()
+    if lower in _SENSITIVE_KEYS:
+        return True
+    for part in ("password", "passwd", "cookie", "authorization", "secret", "api_key", "apikey"):
+        if part in lower:
+            return True
+    # Auth-style tokens only. Keep metric fields: window_tokens, summary_tokens, token_count.
+    if lower in {"token", "access_token", "refresh_token", "id_token", "bearer"}:
+        return True
+    if lower.endswith("_token") and not lower.endswith("_tokens"):
+        return True
+    return False
+
+
 def _scrub(value: Any) -> Any:
     if isinstance(value, Mapping):
         out: dict[str, Any] = {}
         for key, item in value.items():
             key_str = str(key)
-            if key_str.lower() in _SENSITIVE_KEYS or any(
-                part in key_str.lower() for part in ("password", "cookie", "authorization", "secret", "token")
-            ):
+            if _is_sensitive_key(key_str):
                 out[key_str] = "***"
             else:
                 out[key_str] = _scrub(item)

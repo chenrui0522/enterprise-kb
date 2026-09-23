@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class ChatState(TypedDict):
@@ -8,8 +8,10 @@ class ChatState(TypedDict):
     tenant_id: str
     user_question: str
     # Plain dict messages: {"role": "user"|"assistant", "content": str}
-    # Supplied from DB history at each turn (overwrite semantics; checkpointer-safe).
+    # Uncompressed recent window from DB (overwrite semantics; checkpointer-safe).
     history: list[dict]
+    # Latest rolling summary text (long-term memory); may be empty/absent.
+    memory_summary: NotRequired[str]
     rewritten_query: str
     need_retrieval: bool
     # Optional metadata filter (doc_type / table_id / heading_path prefix ...);

@@ -22,6 +22,28 @@ class FileDocumentStorage:
         target.write_bytes(data)
         return str(target.relative_to(self._root))
 
+    def store_staffing(self, batch_id: str, filename: str, data: bytes) -> str:
+        """Persist an original staffing daily-report workbook for a batch."""
+        safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", os.path.basename(filename))
+        directory = self._root / "staffing" / batch_id
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / safe_name
+        target.write_bytes(data)
+        return str(target.relative_to(self._root))
+
+    def store_chat_attachment(self, attachment_id: str, filename: str, data: bytes) -> str:
+        """Persist a chat composer attachment; returns relative storage key."""
+        safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", os.path.basename(filename))
+        directory = self._root / "chat_attachments" / attachment_id
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / safe_name
+        target.write_bytes(data)
+        return str(target.relative_to(self._root))
+
+    def read_bytes(self, storage_key: str) -> bytes:
+        path = self.resolve(storage_key)
+        return path.read_bytes()
+
     def store_image(self, doc_id: str, version_id: str, sha256: str, suffix: str, data: bytes) -> str:
         """Store one image content-addressed under the document version; returns its relative key."""
         relative = f"{doc_id}/{version_id}/images/{sha256}{suffix}"

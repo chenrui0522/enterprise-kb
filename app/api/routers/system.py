@@ -74,17 +74,32 @@ async def _check_milvus(timeout: float) -> str:
 
 
 async def _check_model_service(timeout: float) -> str:
+    """Reachability + required embedding/rerank models actually launched.
+
+    Xinference stays healthy with an empty model list after container restart;
+    treating that as ok left uploads stuck after OCR with opaque embed 404s.
+    """
     settings = get_settings()
     base = settings.embedder_base_url.rstrip("/")
-    # OpenAI-compatible root is .../v1; health is typically on the host root.
-    if base.endswith("/v1"):
-        health_url = f"{base[:-3]}/v1/models"
-    else:
-        health_url = f"{base}/models"
+    # OpenAI-compatible root is .../v1; list endpoint is .../v1/models.
+    health_url = f"{base}/models" if base.endswith("/v1") else f"{base.rstrip('/')}/v1/models"
+    required = {
+        settings.embedder_model.strip(),
+        settings.reranker_model.strip(),
+    }
+    required.discard("")
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(health_url)
             resp.raise_for_status()
+            payload = resp.json()
+        ids = {
+            str(item.get("id") or "")
+            for item in (payload.get("data") or [])
+            if isinstance(item, dict)
+        }
+        if required and not required.issubset(ids):
+            return "fail"
         return "ok"
     except Exception:
         return "fail"
