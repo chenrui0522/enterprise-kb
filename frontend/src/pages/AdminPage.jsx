@@ -213,34 +213,110 @@ function formatAuditTime(value) {
   );
 }
 
+const AUDIT_TIME_PRESETS = [
+  { id: "today", label: "今天" },
+  { id: "7d", label: "近 7 天" },
+  { id: "30d", label: "近 30 天" },
+  { id: "all", label: "全部" },
+  { id: "custom", label: "自定义" },
+];
+
+const AUDIT_PAGE_SIZES = [50, 100, 200];
+
+function resolveAuditTimeRange(preset, customSince, customUntil) {
+  const now = new Date();
+  if (preset === "all") {
+    return { since: "", until: "" };
+  }
+  if (preset === "today") {
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    return { since: start.toISOString(), until: now.toISOString() };
+  }
+  if (preset === "7d" || preset === "30d") {
+    const days = preset === "7d" ? 7 : 30;
+    const since = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+    return { since: since.toISOString(), until: now.toISOString() };
+  }
+  if (preset === "custom") {
+    if (!customSince.trim() || !customUntil.trim()) {
+      return { error: "请填写自定义起止时间" };
+    }
+    const sinceDate = new Date(customSince);
+    const untilDate = new Date(customUntil);
+    if (Number.isNaN(sinceDate.getTime()) || Number.isNaN(untilDate.getTime())) {
+      return { error: "自定义时间格式无效" };
+    }
+    if (sinceDate.getTime() > untilDate.getTime()) {
+      return { error: "开始时间不能晚于结束时间" };
+    }
+    return { since: sinceDate.toISOString(), until: untilDate.toISOString() };
+  }
+  return { since: "", until: "" };
+}
+
 function AuditPanel({ onError }) {
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
   const [action, setAction] = useState("");
   const [actor, setActor] = useState("");
+  const [timePreset, setTimePreset] = useState("all");
+  const [customSince, setCustomSince] = useState("");
+  const [customUntil, setCustomUntil] = useState("");
+  const [offset, setOffset] = useState(0);
+  const [limit, setLimit] = useState(100);
   const [loading, setLoading] = useState(false);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await listAuditEvents({
-        limit: 100,
-        offset: 0,
-        action: action.trim(),
-        actor: actor.trim(),
-      });
-      setItems(data.items || []);
-      setTotal(data.total || 0);
-    } catch (err) {
-      onError(err);
-    } finally {
-      setLoading(false);
-    }
-  }, [action, actor, onError]);
+  const load = useCallback(
+    async (nextOffset = 0) => {
+      const range = resolveAuditTimeRange(timePreset, customSince, customUntil);
+      if (range.error) {
+        onError(new Error(range.error));
+        return;
+      }
+      setLoading(true);
+      try {
+        const data = await listAuditEvents({
+          limit,
+          offset: nextOffset,
+          action: action.trim(),
+          actor: actor.trim(),
+          since: range.since,
+          until: range.until,
+        });
+        setItems(data.items || []);
+        setTotal(data.total || 0);
+        setOffset(typeof data.offset === "number" ? data.offset : nextOffset);
+      } catch (err) {
+        onError(err);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [action, actor, limit, timePreset, customSince, customUntil, onError]
+  );
 
   useEffect(() => {
-    load();
-  }, [load]);
+    // Wait for both custom bounds before auto-query; submit still validates.
+    if (timePreset === "custom" && (!customSince.trim() || !customUntil.trim())) {
+      return;
+    }
+    load(0);
+  }, [load, timePreset, customSince, customUntil]);
+
+  const rangeLabel =
+    total === 0
+      ? "共 0 条"
+      : `第 ${offset + 1}–${offset + items.length} 条，共 ${total}`;
+  const canPrev = offset > 0 && !loading;
+  const canNext = offset + items.length < total && !loading;
+
+  const setPreset = (id) => {
+    setTimePreset(id);
+    if (id !== "custom") {
+      setCustomSince("");
+      setCustomUntil("");
+    }
+  };
 
   return (
     <section className="admin-stack">
@@ -248,7 +324,7 @@ function AuditPanel({ onError }) {
         className="admin-card"
         onSubmit={(e) => {
           e.preventDefault();
-          load();
+          load(0);
         }}
       >
         <h2>审计筛选</h2>
@@ -260,13 +336,70 @@ function AuditPanel({ onError }) {
             <input value={actor} onChange={(e) => setActor(e.target.value)} placeholder="用户名" />
           </Field>
         </div>
+        <Field label="时间">
+          <fieldset className="admin-fieldset">
+            {AUDIT_TIME_PRESETS.map((preset) => (
+              <label key={preset.id} className="admin-check">
+                <input
+                  type="radio"
+                  name="audit-time-preset"
+                  checked={timePreset === preset.id}
+                  onChange={() => setPreset(preset.id)}
+                />
+                {preset.label}
+              </label>
+            ))}
+          </fieldset>
+        </Field>
+        {timePreset === "custom" ? (
+          <div className="admin-grid">
+            <Field label="开始" required>
+              <input
+                type="datetime-local"
+                value={customSince}
+                onChange={(e) => setCustomSince(e.target.value)}
+              />
+            </Field>
+            <Field label="结束" required>
+              <input
+                type="datetime-local"
+                value={customUntil}
+                onChange={(e) => setCustomUntil(e.target.value)}
+              />
+            </Field>
+          </div>
+        ) : null}
         <button type="submit" disabled={loading}>
           {loading ? "查询中…" : "查询"}
         </button>
-        <p className="muted">共 {total} 条（显示最近 {items.length} 条）</p>
+        <p className="muted">{rangeLabel}</p>
       </form>
       <div className="admin-card">
-        <h2>审计事件</h2>
+        <div className="admin-inline admin-audit-toolbar">
+          <h2>审计事件</h2>
+          <div className="admin-inline">
+            <label className="admin-check">
+              每页
+              <select
+                value={limit}
+                onChange={(e) => setLimit(Number(e.target.value))}
+                disabled={loading}
+              >
+                {AUDIT_PAGE_SIZES.map((size) => (
+                  <option key={size} value={size}>
+                    {size}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button type="button" disabled={!canPrev} onClick={() => load(Math.max(0, offset - limit))}>
+              上一页
+            </button>
+            <button type="button" disabled={!canNext} onClick={() => load(offset + limit)}>
+              下一页
+            </button>
+          </div>
+        </div>
         <div className="admin-table-wrap">
           <table className="admin-table">
             <thead>

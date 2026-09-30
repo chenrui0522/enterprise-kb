@@ -14,8 +14,8 @@ MAX_CHAT_ATTACHMENT_BYTES = 40 * 1024 * 1024
 
 
 def save_chat_xlsx(*, user_id: str, filename: str, data: bytes) -> dict:
-    if not filename.lower().endswith((".xlsx", ".xls")):
-        raise AppError("仅支持 Excel（.xlsx）附件", status_code=400)
+    if not filename.lower().endswith((".xlsx", ".xls", ".pdf")):
+        raise AppError("仅支持 Excel（.xlsx）或由该工作簿导出的 PDF 附件", status_code=400)
     if len(data) > MAX_CHAT_ATTACHMENT_BYTES:
         raise AppError("附件过大", status_code=400)
     if len(data) == 0:

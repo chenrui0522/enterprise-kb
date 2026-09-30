@@ -11,6 +11,9 @@ from typing import Any
 from openpyxl import load_workbook
 
 from app.core.errors import AppError
+from app.staffing.pdf_grid import UnreadableStaffingPdf, looks_like_pdf, pdf_to_xlsx_bytes
+
+UNSUPPORTED_UPLOAD_MESSAGE = "无法解析该文件：请上传标准 Excel 工作簿（.xlsx），或由该工作簿导出的 PDF"
 
 KIND_FORMAL = "internal_formal"
 KIND_CONTRACT = "internal_contract"
@@ -97,6 +100,30 @@ def _parse_names_from_text(text: str) -> tuple[list[str], list[str]]:
     return names, ambiguous
 
 
+def _suspected_name_split_pairs(names: list[str]) -> list[tuple[str, str]]:
+    """Flag short/long pairs where one name looks like a PDF-split fragment of the other."""
+    unique = sorted({n.strip() for n in names if n and n.strip()}, key=lambda item: (len(item), item))
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, short in enumerate(unique):
+        if len(short) < 2:
+            continue
+        for long in unique[index + 1 :]:
+            if short == long:
+                continue
+            extra = len(long) - len(short)
+            if extra < 1 or extra > 2:
+                continue
+            if not (long.startswith(short) or long.endswith(short)):
+                continue
+            key = (short, long)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(key)
+    return pairs
+
+
 def _extract_formal_names(personnel_text: str) -> tuple[list[str], list[str]]:
     text = personnel_text.replace("\n", " ")
     m = _COMPANY_BLOCK.search(text)
@@ -175,19 +202,29 @@ def _as_date(value: Any) -> date | None:
 
 
 def parse_daily_report(data: bytes, filename: str = "") -> ParseResult:
+    if looks_like_pdf(data, filename):
+        try:
+            data = pdf_to_xlsx_bytes(data)
+        except UnreadableStaffingPdf:
+            return ParseResult(
+                title_text="",
+                rows=[],
+                warnings=[
+                    ParseWarning(
+                        code="unreadable_workbook",
+                        message="未找到「日期」或「现场施工人员」列",
+                    )
+                ],
+                raw_day_count=0,
+                filename_codes=extract_project_codes(filename),
+            )
     if not is_ooxml_xlsx(data):
-        raise AppError(
-            "无法解析该文件：请另存为标准 Excel 工作簿（.xlsx）后再上传",
-            status_code=415,
-        )
+        raise AppError(UNSUPPORTED_UPLOAD_MESSAGE, status_code=415)
 
     try:
         wb = load_workbook(io.BytesIO(data), data_only=True)
     except Exception as exc:  # noqa: BLE001
-        raise AppError(
-            "无法解析该文件：请另存为标准 Excel 工作簿（.xlsx）后再上传",
-            status_code=415,
-        ) from exc
+        raise AppError(UNSUPPORTED_UPLOAD_MESSAGE, status_code=415) from exc
 
     ws = wb.active
     title_text = _cell_str(ws.cell(1, 1).value)
@@ -223,6 +260,7 @@ def parse_daily_report(data: bytes, filename: str = "") -> ParseResult:
 
     day_people: dict[str, dict[str, set[str]]] = {}  # date -> name -> kinds
     day_rows: dict[str, list[int]] = {}
+    day_stage: dict[str, str | None] = {}
     raw_day_count = 0
 
     for r in range(data_start, (ws.max_row or 0) + 1):
@@ -244,6 +282,20 @@ def parse_daily_report(data: bytes, filename: str = "") -> ParseResult:
         iso = work_date.isoformat()
         day_rows.setdefault(iso, []).append(r)
         stage = _cell_str(ws.cell(r, stage_col).value) if stage_col else None
+        stage = stage or None
+        if iso not in day_stage:
+            day_stage[iso] = stage
+        elif stage and day_stage[iso] and stage != day_stage[iso]:
+            warnings.append(
+                ParseWarning(
+                    code="same_day_stage_conflict",
+                    message=f"同一日期出现多个当前阶段：{day_stage[iso]} / {stage}",
+                    row=r,
+                    detail={"date": iso, "stages": [day_stage[iso], stage]},
+                )
+            )
+        elif stage and not day_stage[iso]:
+            day_stage[iso] = stage
 
         personnel_text = _cell_str(ws.cell(r, personnel_col).value)
         formal, amb_f = _extract_formal_names(personnel_text)
@@ -307,6 +359,7 @@ def parse_daily_report(data: bytes, filename: str = "") -> ParseResult:
     kinds_by_name: dict[str, set[str]] = {}
     for iso, people in sorted(day_people.items()):
         src = day_rows.get(iso, [None])[0]
+        stage = day_stage.get(iso)
         for name, kinds in people.items():
             kinds_by_name.setdefault(name, set()).update(kinds)
             for kind in sorted(kinds):
@@ -315,6 +368,7 @@ def parse_daily_report(data: bytes, filename: str = "") -> ParseResult:
                         work_date=iso,
                         person_name=name,
                         person_kind=kind,
+                        stage=stage,
                         source_row=src,
                     )
                 )
@@ -325,12 +379,24 @@ def parse_daily_report(data: bytes, filename: str = "") -> ParseResult:
                 ParseWarning(
                     code="name_kind_collision",
                     message=(
-                        f"「{name}」同时出现正式我司与我司·外包性质，"
+                        f"「{name}」同时出现正式我司与机电服务处，"
                         "可能不是同一人，请人工判定"
                     ),
                     detail={"person_name": name, "kinds": sorted(kinds)},
                 )
             )
+
+    for short, long in _suspected_name_split_pairs(list(kinds_by_name)):
+        warnings.append(
+            ParseWarning(
+                code="suspected_name_split",
+                message=(
+                    f"「{short}」与「{long}」疑似同一人被拆成两条"
+                    "（常见于 PDF 换行/抽表），请人工复核后合并或确认分列"
+                ),
+                detail={"short_name": short, "long_name": long, "names": [short, long]},
+            )
+        )
 
     return ParseResult(
         title_text=title_text,

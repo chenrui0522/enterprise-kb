@@ -14,6 +14,7 @@ from app.chat.memory.compress import maybe_enqueue_compress_for_conversation
 from app.chat.memory.context import build_chat_context
 from app.chat.service import (
     create_conversation,
+    delete_conversation,
     get_conversation,
     get_latest_conversation_summary,
     list_conversations,
@@ -32,14 +33,28 @@ from app.chat.title import (
     maybe_enqueue_title_polish,
 )
 from app.chat.tools.attachments import load_attachment, save_chat_xlsx
-from app.chat.tools.registry import WEAK_CLARIFY_COPY, list_tools_for_principal
+from app.chat.tools.leave_ledger_orchestrator import (
+    apply_leave_ledger_action,
+    handle_leave_ledger_message,
+    update_leave_ledger_state,
+)
+from app.chat.tools.registry import (
+    LEAVE_WEAK_CLARIFY_COPY,
+    TOOL_CONFLICT_CLARIFY_COPY,
+    TOOL_LEAVE_LEDGER,
+    TOOL_STAFFING,
+    WEAK_CLARIFY_COPY,
+    list_tools_for_principal,
+)
 from app.chat.tools.router import (
     route_turn,
+    user_affirms_leave,
     user_affirms_staffing,
+    user_declines_leave,
     user_declines_staffing,
 )
 from app.chat.tools.staffing_orchestrator import (
-    apply_tool_action,
+    apply_tool_action as apply_staffing_action,
     clear_tool_state,
     handle_staffing_message,
     set_tool_state,
@@ -246,6 +261,60 @@ async def update_conversation_endpoint(
     return ConversationOut.model_validate(conversation)
 
 
+async def _best_effort_clear_checkpoint(request: Request, conversation_id: str) -> None:
+    checkpointer = getattr(request.app.state, "checkpointer", None)
+    if checkpointer is None:
+        return
+    try:
+        if hasattr(checkpointer, "adelete_thread"):
+            await checkpointer.adelete_thread(conversation_id)
+        elif hasattr(checkpointer, "delete_thread"):
+            result = checkpointer.delete_thread(conversation_id)
+            if asyncio.iscoroutine(result):
+                await result
+    except Exception:
+        logger.exception(
+            "conversation checkpoint cleanup failed conversation_id=%s",
+            conversation_id,
+        )
+
+
+@router.delete("/conversations/{conversation_id}", status_code=204)
+async def delete_conversation_endpoint(
+    conversation_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    tenant_id: str = Depends(tenant_from_principal),
+    principal: Principal = Depends(require_permission(PERM_CHAT_USE)),
+) -> None:
+    await delete_conversation(
+        session,
+        tenant_id,
+        conversation_id,
+        created_by=principal.user_id,
+    )
+    await _best_effort_clear_checkpoint(request, conversation_id)
+    log_event(
+        logger,
+        "conversation deleted",
+        event="conversation.delete",
+        conversation_id=conversation_id,
+        tenant_id=tenant_id,
+        user_id=principal.user_id,
+    )
+    try:
+        await write_audit(
+            session,
+            tenant_id=tenant_id,
+            action="conversation.delete",
+            resource_type="conversation",
+            resource_id=conversation_id,
+            actor=principal.user_id,
+        )
+    except Exception:
+        logger.exception("conversation.delete audit failed id=%s", conversation_id)
+
+
 @router.get("/conversations", response_model=list[ConversationOut])
 async def conversations_endpoint(
     session: AsyncSession = Depends(get_db_session),
@@ -289,20 +358,36 @@ async def chat_tool_action_endpoint(
     conversation = await get_conversation(
         session, tenant_id, body.conversation_id, created_by=principal.user_id
     )
-    result = await apply_tool_action(
-        session,
-        principal=principal,
-        conversation=conversation,
-        action=body.action,
-        payload=body.payload,
-    )
+    state = dict(conversation.tool_state or {})
+    active_tool = state.get("active_tool")
+    action = body.action or ""
+    if action.startswith("leave_ledger.") or active_tool == TOOL_LEAVE_LEDGER:
+        result = await apply_leave_ledger_action(
+            session,
+            principal=principal,
+            conversation=conversation,
+            action=action,
+            payload=body.payload,
+        )
+        tool_meta = TOOL_LEAVE_LEDGER
+    else:
+        result = await apply_staffing_action(
+            session,
+            principal=principal,
+            conversation=conversation,
+            action=action,
+            payload=body.payload,
+        )
+        tool_meta = TOOL_STAFFING
     await save_user_message(
         session,
         conversation.id,
         tenant_id,
         f"[工具动作] {body.action}",
     )
-    meta = {"card": result.get("card")} if result.get("card") else None
+    meta = {"tool": tool_meta}
+    if result.get("card"):
+        meta["card"] = result["card"]
     await save_assistant_turn(
         session,
         conversation.id,
@@ -491,7 +576,9 @@ async def _chat_event_stream_inner(
                     logger.warning("title polish enqueue failed", exc_info=True)
 
             # Explicit tool selection updates conversation state; "" clears sticky tool.
-            if payload.active_tool:
+            if payload.active_tool == TOOL_LEAVE_LEDGER:
+                update_leave_ledger_state(conversation, active_tool=TOOL_LEAVE_LEDGER)
+            elif payload.active_tool:
                 update_staffing_state(conversation, active_tool=payload.active_tool)
             elif payload.active_tool == "":
                 state = dict(conversation.tool_state or {})
@@ -500,6 +587,7 @@ async def _chat_event_stream_inner(
 
             state = dict(conversation.tool_state or {})
             pending_clarify = bool(state.get("pending_clarify"))
+            pending_clarify_for = state.get("pending_clarify_for")
             active_from_state = state.get("active_tool")
             if payload.active_tool == "":
                 active_tool = None
@@ -508,18 +596,43 @@ async def _chat_event_stream_inner(
             else:
                 active_tool = active_from_state
 
-            if pending_clarify and user_affirms_staffing(payload.message):
-                decision_kind = "staffing"
-                auto_note = "已确认使用人员投入。"
-                state.pop("pending_clarify", None)
-                set_tool_state(conversation, state)
-                update_staffing_state(conversation, active_tool="staffing")
-            elif pending_clarify and user_declines_staffing(payload.message):
-                decision_kind = "none"
-                auto_note = None
-                state.pop("pending_clarify", None)
-                set_tool_state(conversation, state)
-            else:
+            decision = None
+            decision_kind = None
+            auto_note = None
+            if pending_clarify:
+                if user_affirms_staffing(payload.message) and pending_clarify_for in (
+                    None,
+                    TOOL_STAFFING,
+                    "conflict",
+                ):
+                    decision_kind = "staffing"
+                    auto_note = "已确认使用人员投入。"
+                    state.pop("pending_clarify", None)
+                    state.pop("pending_clarify_for", None)
+                    set_tool_state(conversation, state)
+                    update_staffing_state(conversation, active_tool=TOOL_STAFFING)
+                elif user_affirms_leave(payload.message) and pending_clarify_for in (
+                    TOOL_LEAVE_LEDGER,
+                    "conflict",
+                ):
+                    decision_kind = "leave_ledger"
+                    auto_note = "已确认使用调休台账。"
+                    state.pop("pending_clarify", None)
+                    state.pop("pending_clarify_for", None)
+                    set_tool_state(conversation, state)
+                    update_leave_ledger_state(
+                        conversation, active_tool=TOOL_LEAVE_LEDGER
+                    )
+                elif user_declines_staffing(payload.message) or user_declines_leave(
+                    payload.message
+                ):
+                    decision_kind = "none"
+                    auto_note = None
+                    state.pop("pending_clarify", None)
+                    state.pop("pending_clarify_for", None)
+                    set_tool_state(conversation, state)
+
+            if decision_kind is None:
                 decision = route_turn(
                     principal,
                     active_tool=active_tool,
@@ -527,9 +640,11 @@ async def _chat_event_stream_inner(
                     filename=filename,
                 )
                 decision_kind = decision.kind
-                auto_note = (
-                    "已按人员投入处理。" if decision.reason == "strong_rules" else None
-                )
+                if decision.reason == "strong_rules":
+                    if decision.kind == "staffing":
+                        auto_note = "已按人员投入处理。"
+                    elif decision.kind == "leave_ledger":
+                        auto_note = "已按调休台账处理。"
 
             settings = get_settings()
             ctx = await build_chat_context(
@@ -543,10 +658,22 @@ async def _chat_event_stream_inner(
             )
             await session.commit()
 
-            if decision_kind == "clarify":
-                content = WEAK_CLARIFY_COPY
+            if decision_kind in ("clarify", "conflict_clarify"):
+                if decision_kind == "conflict_clarify":
+                    content = TOOL_CONFLICT_CLARIFY_COPY
+                    clarify_for = "conflict"
+                    clarify_tool = None
+                elif decision and decision.tool_id == TOOL_LEAVE_LEDGER:
+                    content = LEAVE_WEAK_CLARIFY_COPY
+                    clarify_for = TOOL_LEAVE_LEDGER
+                    clarify_tool = TOOL_LEAVE_LEDGER
+                else:
+                    content = WEAK_CLARIFY_COPY
+                    clarify_for = TOOL_STAFFING
+                    clarify_tool = TOOL_STAFFING
                 state = dict(conversation.tool_state or {})
                 state["pending_clarify"] = True
+                state["pending_clarify_for"] = clarify_for
                 set_tool_state(conversation, state)
                 assistant_message = await save_assistant_turn(
                     session,
@@ -555,7 +682,7 @@ async def _chat_event_stream_inner(
                     content,
                     rewritten_query=None,
                     citations=[],
-                    meta={"tool": "staffing", "clarify": True},
+                    meta={"tool": clarify_tool, "clarify": True},
                 )
                 await session.commit()
                 yield sse_event({"event": "token", "data": content})
@@ -618,6 +745,58 @@ async def _chat_event_stream_inner(
                     logger,
                     "chat staffing done",
                     event="chat.tool.staffing",
+                    ok=True,
+                )
+                return
+
+            if decision_kind == "leave_ledger":
+                try:
+                    result = await handle_leave_ledger_message(
+                        session,
+                        principal=principal,
+                        conversation=conversation,
+                        message=payload.message,
+                        attachment=attachment,
+                        auto_note=auto_note,
+                    )
+                except AppError as exc:
+                    content = exc.message
+                    result = {"content": content, "card": None}
+                content = result["content"]
+                card = result.get("card")
+                meta = (
+                    {"tool": TOOL_LEAVE_LEDGER, "card": card}
+                    if card
+                    else {"tool": TOOL_LEAVE_LEDGER}
+                )
+                assistant_message = await save_assistant_turn(
+                    session,
+                    conversation_id,
+                    tenant_id,
+                    content,
+                    rewritten_query=None,
+                    citations=[],
+                    meta=meta,
+                )
+                await session.commit()
+                yield sse_event({"event": "token", "data": content})
+                yield sse_event(
+                    {
+                        "event": "done",
+                        "data": {
+                            "conversation_id": conversation_id,
+                            "message_id": assistant_message.id,
+                            "answer": content,
+                            "citations": [],
+                            "card": card,
+                            "error": None,
+                        },
+                    }
+                )
+                log_event(
+                    logger,
+                    "chat leave_ledger done",
+                    event="chat.tool.leave_ledger",
                     ok=True,
                 )
                 return

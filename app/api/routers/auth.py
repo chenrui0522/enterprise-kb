@@ -14,6 +14,7 @@ from app.identity.constants import (
     SESSION_COOKIE_NAME,
 )
 from app.identity.deps import get_current_principal, require_permission
+from app.identity.feature_gates import can_use_leave_ledger, can_use_staffing
 from app.identity.loader import load_principal
 from app.identity.passwords import hash_password, verify_password
 from app.identity.principal import Principal
@@ -49,6 +50,8 @@ def _principal_out(p: Principal) -> PrincipalOut:
         permissions=list(p.permissions),
         position_ids=list(p.position_ids),
         establishment_org_unit_ids=list(p.establishment_org_unit_ids),
+        can_staffing=can_use_staffing(p, write=None),
+        can_leave_ledger=can_use_leave_ledger(p, write=None),
     )
 
 

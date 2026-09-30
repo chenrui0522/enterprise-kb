@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db_session
 from app.core.errors import AppError
 from app.identity.constants import SESSION_COOKIE_NAME
+from app.identity.feature_gates import can_use_leave_ledger, can_use_staffing
 from app.identity.loader import load_principal
 from app.identity.principal import Principal
 from app.identity.sessions import get_session_by_token
@@ -77,3 +78,47 @@ async def tenant_from_principal(
 
     set_current_tenant(principal.tenant_id)
     return principal.tenant_id
+
+
+def require_staffing(*, write: bool = False):
+    """Permission + project_mgmt subtree (or admin bypass)."""
+    key = f"staffing:{'write' if write else 'read'}"
+    cached = _permission_deps.get(key)
+    if cached is not None:
+        return cached
+
+    async def _dep(principal: Principal = Depends(get_current_principal)) -> Principal:
+        ok = (
+            can_use_staffing(principal, write=True)
+            if write
+            else can_use_staffing(principal, write=None)
+        )
+        if not ok:
+            raise AppError("缺少人员投入权限或不在项目管理部组织范围", status_code=403)
+        return principal
+
+    _permission_deps[key] = _dep
+    return _dep
+
+
+def require_leave_ledger(*, write: bool = False):
+    """Permission + ops subtree (or admin bypass)."""
+    key = f"leave_ledger:{'write' if write else 'read'}"
+    cached = _permission_deps.get(key)
+    if cached is not None:
+        return cached
+
+    async def _dep(principal: Principal = Depends(get_current_principal)) -> Principal:
+        ok = (
+            can_use_leave_ledger(principal, write=True)
+            if write
+            else can_use_leave_ledger(principal, write=None)
+        )
+        if not ok:
+            raise AppError(
+                "缺少调休台账权限或不在运营管理中心组织范围", status_code=403
+            )
+        return principal
+
+    _permission_deps[key] = _dep
+    return _dep

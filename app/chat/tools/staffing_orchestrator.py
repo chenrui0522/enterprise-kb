@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.chat.tools.registry import TOOL_STAFFING, ensure_tool_allowed
 from app.core.config import get_settings
 from app.core.errors import AppError
-from app.identity.constants import PERM_STAFFING_WRITE
+from app.identity.feature_gates import can_use_staffing
 from app.identity.principal import Principal
 from app.ingestion.storage import FileDocumentStorage
 from app.models.entity import Conversation, new_id
@@ -17,7 +17,7 @@ from app.staffing import service as staffing_service
 
 KIND_LABEL = {
     "internal_formal": "正式我司",
-    "internal_contract": "我司·外包性质",
+    "internal_contract": "机电服务处",
 }
 
 
@@ -62,6 +62,8 @@ def _summary_card(summary: dict[str, Any]) -> dict[str, Any]:
             or KIND_LABEL.get(p.get("person_kind"), p.get("person_kind")),
             "days_on_site": p["days_on_site"],
             "dates": list(p.get("dates") or []),
+            "date_stages": dict(p.get("date_stages") or {}),
+            "stages": list(p.get("stages") or []),
             "stint_count": p.get("stint_count") or len(p.get("stints") or []),
             "stints": list(p.get("stints") or []),
         }
@@ -79,6 +81,7 @@ def _summary_card(summary: dict[str, Any]) -> dict[str, Any]:
         "date_to": summary.get("date_to"),
         "by_kind": summary.get("by_kind") or {},
         "people": people,
+        "name_split_suspects": list(summary.get("name_split_suspects") or []),
         "actions": [
             {"id": "export_xlsx", "label": "导出 Excel"},
             {"id": "void_prompt", "label": "作废某人…"},
@@ -100,7 +103,14 @@ def _batch_card(batch, *, auto_note: str | None = None) -> dict[str, Any]:
     warnings.sort(
         key=lambda w: 0
         if w.get("code")
-        in {"name_kind_collision", "project_unmatched", "project_ambiguous"}
+        in {
+            "name_kind_collision",
+            "project_unmatched",
+            "project_ambiguous",
+            "suspected_name_split",
+            "roster_name_unresolved",
+            "roster_unavailable",
+        }
         else 1
     )
     collisions = [
@@ -112,6 +122,16 @@ def _batch_card(batch, *, auto_note: str | None = None) -> dict[str, Any]:
         for w in warnings
         if w.get("code") == "name_kind_collision" and (w.get("detail") or {}).get("person_name")
     ]
+    roster_unresolved = [
+        {
+            "token": (w.get("detail") or {}).get("token"),
+            "candidates": list((w.get("detail") or {}).get("candidates") or []),
+            "message": w.get("message"),
+        }
+        for w in warnings
+        if w.get("code") == "roster_name_unresolved" and (w.get("detail") or {}).get("token")
+    ]
+    roster_unavailable = any(w.get("code") == "roster_unavailable" for w in warnings)
     match_info = batch.match_info if isinstance(batch.match_info, dict) else {}
     match_status = match_info.get("status") or ("matched" if batch.project_id else "unmatched")
     candidates = list(match_info.get("candidates") or [])
@@ -133,6 +153,8 @@ def _batch_card(batch, *, auto_note: str | None = None) -> dict[str, Any]:
         "match_codes": list(match_info.get("codes_tried") or []),
         "project_candidates": candidates,
         "collisions": collisions,
+        "roster_unresolved": roster_unresolved,
+        "roster_unavailable": roster_unavailable,
         "warning_count": len(warnings),
         "warnings": warnings[:30],
         "note": auto_note,
@@ -212,7 +234,7 @@ async def handle_staffing_message(
     if not attachment:
         return {
             "content": (
-                "人员投入助手已就绪。请上传项目日报（.xlsx），"
+                "人员投入助手已就绪。请上传项目日报（Excel .xlsx，或由该工作簿导出的 PDF），"
                 "或询问当前已绑定项目的「有谁 / 各几天」。"
             ),
             "card": None,
@@ -250,8 +272,8 @@ async def apply_tool_action(
     project_id = payload.get("project_id") or staffing.get("project_id")
 
     if action == "ack_and_confirm":
-        if PERM_STAFFING_WRITE not in (principal.permissions or ()):
-            raise AppError("需要人员投入写入权限", status_code=403)
+        if not can_use_staffing(principal, write=True):
+            raise AppError("需要人员投入写入权限或不在项目管理部组织范围", status_code=403)
         if not batch_id:
             raise AppError("没有可确认的导入批次", status_code=400)
         batch = await staffing_service.get_batch(session, principal.tenant_id, batch_id)
@@ -259,12 +281,18 @@ async def apply_tool_action(
         if not bind_project_id:
             raise AppError("请先选定项目后再确认入库", status_code=400)
         if batch.status == "needs_review":
+            skip_ack = {
+                "name_kind_collision",
+                "roster_name_unresolved",
+                "roster_unavailable",
+                "roster_name_corrected",
+            }
             resolutions: dict[str, Any] = {}
             for w in batch.warnings or []:
                 if not isinstance(w, dict) or not w.get("code"):
                     continue
                 code = w["code"]
-                if code == "name_kind_collision":
+                if code in skip_ack:
                     continue
                 resolutions[code] = "acknowledged"
             collision_payload = payload.get("name_kind_collision")
@@ -275,6 +303,22 @@ async def apply_tool_action(
                 for w in (batch.warnings or [])
             ):
                 raise AppError("请先裁定同名双身份（分列或合并）", status_code=400)
+            roster_payload = payload.get("roster_name_unresolved")
+            if isinstance(roster_payload, dict):
+                resolutions["roster_name_unresolved"] = roster_payload
+            elif any(
+                isinstance(w, dict) and w.get("code") == "roster_name_unresolved"
+                for w in (batch.warnings or [])
+            ):
+                raise AppError("请先裁定花名册无法确认的姓名", status_code=400)
+            if any(
+                isinstance(w, dict) and w.get("code") == "roster_unavailable"
+                for w in (batch.warnings or [])
+            ):
+                raise AppError(
+                    "人员信息花名册不可用，请配置后重新导入",
+                    status_code=400,
+                )
             batch = await staffing_service.review_batch(
                 session,
                 principal=principal,
@@ -307,8 +351,8 @@ async def apply_tool_action(
         }
 
     if action == "void_person":
-        if PERM_STAFFING_WRITE not in (principal.permissions or ()):
-            raise AppError("需要人员投入写入权限", status_code=403)
+        if not can_use_staffing(principal, write=True):
+            raise AppError("需要人员投入写入权限或不在项目管理部组织范围", status_code=403)
         if not project_id:
             raise AppError("缺少项目", status_code=400)
         names = payload.get("person_names") or []

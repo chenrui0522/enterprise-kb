@@ -32,6 +32,7 @@ def _principal(project_ids: tuple[str, ...] = ("proj2515",)) -> Principal:
         clearance="general",
         permissions=(PERM_STAFFING_READ, PERM_STAFFING_WRITE),
         project_ids=project_ids,
+        staffing_org_ok=True,
     )
 
 
@@ -201,6 +202,7 @@ async def test_project_summary_stints_and_export(tmp_path) -> None:
                     person_name="张三",
                     person_kind=KIND_FORMAL,
                     status="active",
+                    stage="电气安装" if d.month == 3 else "机械安装",
                 )
             )
         await session.commit()
@@ -215,6 +217,12 @@ async def test_project_summary_stints_and_export(tmp_path) -> None:
         assert person["stints"][0]["exit_date"] == "2026-01-13"
         assert person["stints"][1]["entry_date"] == "2026-03-09"
         assert person["stints"][1]["exit_date"] == "2026-03-11"
+        assert person["stages"] == [
+            {"stage": "机械安装", "days": 3},
+            {"stage": "电气安装", "days": 3},
+        ]
+        assert person["stints"][0]["stage_label"] == "机械安装"
+        assert person["stints"][1]["stage_label"] == "电气安装"
 
         from app.chat.tools.staffing_orchestrator import _summary_card
 
@@ -222,35 +230,140 @@ async def test_project_summary_stints_and_export(tmp_path) -> None:
         card_person = next(p for p in card["people"] if p["person_name"] == "张三")
         assert card_person["stint_count"] == 2
         assert len(card_person["stints"]) == 2
+        assert card_person["stages"][0]["stage"] == "机械安装"
+        assert card_person["stints"][1]["stage_label"] == "电气安装"
 
         xlsx = await staffing_service.export_project_xlsx(
             session, principal=principal, project_id=project_id
         )
         wb = load_workbook(BytesIO(xlsx))
-        ws = wb["汇总"]
-        headers = [c.value for c in next(ws.iter_rows(min_row=7, max_row=7))]
-        assert "进场次数" in headers
-        assert "在场摘要" in headers
-        assert "第1段入" in headers
-        assert "第1段天数" in headers
-        assert "第2段出" in headers
-        data_row = None
-        for row in ws.iter_rows(min_row=8, values_only=True):
-            if row and row[0] == "张三":
-                data_row = row
-                break
-        assert data_row is not None
-        assert data_row[headers.index("进场次数")] == 2
-        assert "第1次" in str(data_row[headers.index("在场摘要")])
-        assert data_row[headers.index("第1段入")] == "2026-01-11"
-        assert data_row[headers.index("第2段出")] == "2026-03-11"
+        assert wb.sheetnames == ["人员投入汇总表"]
+        ws = wb["人员投入汇总表"]
+        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        assert headers == [
+            "序号",
+            "日期",
+            "姓名",
+            "项目号",
+            "项目阶段",
+            "部门",
+            "职务",
+            "项目名称",
+        ]
+        detail_rows = list(ws.iter_rows(min_row=2, values_only=True))
+        assert len(detail_rows) == 6
+        assert detail_rows[0][0] == 1
+        assert detail_rows[0][2] == "张三"
+        assert detail_rows[0][3] == 2515
+        assert detail_rows[0][4] == "机械安装"
+        assert detail_rows[0][7] == "2515"
+        march = [r for r in detail_rows if r[4] == "电气安装"]
+        assert len(march) == 3
+        assert all(r[2] == "张三" for r in march)
+        # Dates are contiguous in two blocks — reconstructible as stints from person-days.
+        dates = [r[1].date() if hasattr(r[1], "date") else r[1] for r in detail_rows]
+        assert dates[0].isoformat() == "2026-01-11"
+        assert dates[-1].isoformat() == "2026-03-11"
 
-        ws_stint = wb["工期段"]
-        stint_rows = list(ws_stint.iter_rows(min_row=2, values_only=True))
-        assert len(stint_rows) == 2
-        assert stint_rows[0][:5] == ("张三", "正式我司", 1, "2026-01-11", "2026-01-13")
-        assert stint_rows[1][2:5] == (2, "2026-03-09", "2026-03-11")
+    await engine.dispose()
 
+
+@pytest.mark.asyncio
+async def test_export_roster_fills_department_title(tmp_path, monkeypatch) -> None:
+    """Roster 姓名 match fills 部门/职务; contract fallback is 机电服务处."""
+    from datetime import date
+    from io import BytesIO
+    from pathlib import Path
+
+    from openpyxl import Workbook, load_workbook
+
+    from app.core.config import get_settings
+    from app.models.entity import new_id
+    from app.staffing import roster as roster_mod
+
+    roster_path = Path(tmp_path) / "roster.xlsx"
+    rwb = Workbook()
+    rws = rwb.active
+    rws.append(["序列", "姓名", "部门", "工种", "备注", "待进场"])
+    rws.append([1, "王亮", "项目管理部", "项目经理", "", ""])
+    rwb.save(roster_path)
+    monkeypatch.setenv("KB_STAFFING_ROSTER_PATH", str(roster_path))
+    get_settings.cache_clear()
+    roster_mod._cached_roster.cache_clear()
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'roster_export.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal(project_ids=("proj_roster",))
+    project_id = "proj_roster"
+
+    async with factory() as session:
+        session.add(
+            Project(
+                id=project_id,
+                tenant_id="autley",
+                code="2532",
+                name="岩心库二期项目",
+                status="active",
+            )
+        )
+        batch_id = "broster"
+        session.add(
+            StaffingImportBatch(
+                id=batch_id,
+                tenant_id="autley",
+                project_id=project_id,
+                status="confirmed",
+                filename="r.xlsx",
+                storage_key="x",
+                uploaded_by=principal.user_id,
+                warnings=[],
+                parse_result={"rows": []},
+                resolved_warnings={},
+                match_info={"status": "matched"},
+            )
+        )
+        session.add(
+            StaffingAttendanceFact(
+                id=new_id(),
+                tenant_id="autley",
+                project_id=project_id,
+                batch_id=batch_id,
+                work_date=date(2026, 1, 1),
+                person_name="王亮",
+                person_kind=KIND_FORMAL,
+                status="active",
+                stage="软件调试",
+            )
+        )
+        session.add(
+            StaffingAttendanceFact(
+                id=new_id(),
+                tenant_id="autley",
+                project_id=project_id,
+                batch_id=batch_id,
+                work_date=date(2026, 1, 1),
+                person_name="史承志",
+                person_kind=KIND_CONTRACT,
+                status="active",
+                stage="机械安装",
+            )
+        )
+        await session.commit()
+
+        xlsx = await staffing_service.export_project_xlsx(
+            session, principal=principal, project_id=project_id
+        )
+        ws = load_workbook(BytesIO(xlsx)).active
+        by_name = {r[2]: r for r in ws.iter_rows(min_row=2, values_only=True)}
+        assert by_name["王亮"][5] == "项目管理部"
+        assert by_name["王亮"][6] == "项目经理"
+        assert by_name["史承志"][5] == "机电服务处"
+        assert not by_name["史承志"][6]
+
+    get_settings.cache_clear()
+    roster_mod._cached_roster.cache_clear()
     await engine.dispose()
 
 

@@ -192,6 +192,7 @@ textarea {
   cursor: pointer;
 }
 .conversation-rename-btn,
+.conversation-delete-btn,
 .chat-rename-btn {
   flex-shrink: 0;
   border: none;
@@ -206,6 +207,10 @@ textarea {
 .chat-rename-btn:hover {
   background: rgba(21, 101, 192, 0.1);
   color: var(--accent-dark, #1565c0);
+}
+.conversation-delete-btn:hover {
+  background: rgba(185, 28, 28, 0.1);
+  color: #b91c1c;
 }
 .conversation-item span {
   flex: 1;
@@ -599,6 +604,43 @@ textarea {
   border-radius: 10px;
   background: #fff8e1;
   border: 1px solid #ffe082;
+}
+.staffing-name-split-banner {
+  background: #fff3e0;
+  border-color: #ffcc80;
+}
+.staffing-name-split-row td:first-child {
+  font-weight: 600;
+}
+.staffing-inline-tag {
+  display: inline-block;
+  margin-top: 2px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #ffe0b2;
+  color: #e65100;
+  font-size: 11px;
+  font-weight: 600;
+}
+.staffing-inline-stage {
+  margin-top: 2px;
+  font-size: 12px;
+}
+.staffing-stage-cell {
+  font-size: 12px;
+  max-width: 140px;
+}
+.staffing-stint-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: baseline;
+  margin: 4px 0;
+}
+.staffing-stint-stage {
+  font-weight: 600;
+  color: #1565c0;
+  white-space: nowrap;
 }
 .collision-row {
   margin-bottom: 8px;
@@ -1280,5 +1322,13 @@ textarea {
 .admin-time {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+.admin-audit-toolbar {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.admin-audit-toolbar h2 {
+  margin: 0;
 }
 

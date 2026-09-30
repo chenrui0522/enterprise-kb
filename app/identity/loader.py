@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.identity.constants import RELATION_ESTABLISHMENT
+from app.identity.feature_gates import compute_feature_org_flags
 from app.identity.principal import Principal
 from app.models.identity import (
     Position,
@@ -65,6 +66,13 @@ async def load_principal(db: AsyncSession, user_id: str) -> Principal | None:
         ).scalars().all()
         permissions.update(perm_rows)
 
+    staffing_org_ok, leave_ledger_org_ok = await compute_feature_org_flags(
+        db,
+        tenant_id=user.tenant_id,
+        org_unit_ids=org_unit_ids,
+        permissions=permissions,
+    )
+
     return Principal(
         user_id=user.id,
         tenant_id=user.tenant_id,
@@ -78,4 +86,6 @@ async def load_principal(db: AsyncSession, user_id: str) -> Principal | None:
         permissions=tuple(sorted(permissions)),
         position_ids=tuple(sorted(position_ids)),
         establishment_org_unit_ids=tuple(sorted(establishment_ids)),
+        staffing_org_ok=staffing_org_ok,
+        leave_ledger_org_ok=leave_ledger_org_ok,
     )

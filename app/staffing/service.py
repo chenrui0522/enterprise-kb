@@ -15,8 +15,13 @@ from app.models.entity import AuditEvent, new_id
 from app.models.identity import Project
 from app.models.staffing import StaffingAttendanceFact, StaffingImportBatch
 from app.staffing.match import match_project, match_to_dict
-from app.staffing.parse import parse_daily_report, parse_result_to_dict
-from app.staffing.stints import build_stints, format_stints_summary
+from app.staffing.parse import _suspected_name_split_pairs, parse_daily_report, parse_result_to_dict
+from app.staffing.roster import (
+    classify_name_against_roster,
+    correct_names_against_roster,
+    get_roster,
+)
+from app.staffing.stints import annotate_stints_with_stages, build_stints, stage_day_counts
 
 logger = get_logger("staffing")
 
@@ -86,9 +91,30 @@ async def create_import_batch(
 
     from dataclasses import asdict
 
-    warnings = [asdict(w) for w in result.warnings]
+    parse_dict = parse_result_to_dict(result)
+    corrected_rows, roster_warnings = correct_names_against_roster(parse_dict["rows"])
+    parse_dict["rows"] = corrected_rows
+    corrected_from = {
+        (w.get("detail") or {}).get("from_name")
+        for w in roster_warnings
+        if w.get("code") == "roster_name_corrected"
+    }
+    warnings = [
+        asdict(w)
+        for w in result.warnings
+        if not (
+            w.code == "suspected_name_split"
+            and (w.detail or {}).get("short_name") in corrected_from
+        )
+    ]
+    warnings.extend(roster_warnings)
 
-    needs_review = bool(warnings) or match.status != "matched"
+    blocking_codes = {
+        w.get("code")
+        for w in warnings
+        if isinstance(w, dict) and w.get("code") != "roster_name_corrected"
+    }
+    needs_review = bool(blocking_codes) or match.status != "matched"
     if match.status == "unmatched":
         warnings.append(
             {
@@ -119,7 +145,7 @@ async def create_import_batch(
         storage_key=storage_key,
         uploaded_by=principal.user_id,
         warnings=warnings,
-        parse_result=parse_result_to_dict(result),
+        parse_result=parse_dict,
         resolved_warnings={},
         match_info=match_to_dict(match),
     )
@@ -135,7 +161,7 @@ async def create_import_batch(
             "filename": filename,
             "warning_count": len(warnings),
             "match": match.status,
-            "person_days": len(result.rows),
+            "person_days": len(parse_dict.get("rows") or []),
         },
     )
     await session.commit()
@@ -186,6 +212,9 @@ async def review_batch(
         resolved.update(resolutions)
     batch.resolved_warnings = resolved
 
+    if resolutions and "roster_name_unresolved" in resolutions:
+        _apply_roster_resolutions_to_parse_result(batch, resolutions["roster_name_unresolved"])
+
     if person_renames and batch.parse_result:
         rows = batch.parse_result.get("rows") or []
         for row in rows:
@@ -193,6 +222,22 @@ async def review_batch(
             if old in person_renames:
                 row["person_name"] = person_renames[old]
         batch.parse_result = {**batch.parse_result, "rows": rows}
+        # Drop split warnings that were fixed by renaming.
+        kept = []
+        for warning in batch.warnings or []:
+            if not isinstance(warning, dict):
+                kept.append(warning)
+                continue
+            if warning.get("code") != "suspected_name_split":
+                kept.append(warning)
+                continue
+            detail = warning.get("detail") if isinstance(warning.get("detail"), dict) else {}
+            short = detail.get("short_name")
+            long = detail.get("long_name")
+            if short in person_renames or long in person_renames.values() or long in person_renames:
+                continue
+            kept.append(warning)
+        batch.warnings = kept
 
     # Determine remaining open warnings
     open_codes = _open_warning_codes_from(batch.warnings or [], resolved, batch.project_id)
@@ -219,6 +264,97 @@ async def review_batch(
 def _collision_resolutions(resolved: dict[str, Any]) -> dict[str, Any]:
     raw = resolved.get("name_kind_collision")
     return raw if isinstance(raw, dict) else {}
+
+
+def _roster_unresolved_resolutions(resolved: dict[str, Any]) -> dict[str, Any]:
+    raw = resolved.get("roster_name_unresolved")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _is_roster_unresolved_resolved(warnings: list, resolved: dict[str, Any]) -> bool:
+    unresolved = [
+        w
+        for w in warnings
+        if isinstance(w, dict) and w.get("code") == "roster_name_unresolved"
+    ]
+    if not unresolved:
+        return True
+    by_token = _roster_unresolved_resolutions(resolved)
+    for w in unresolved:
+        detail = w.get("detail") if isinstance(w.get("detail"), dict) else {}
+        token = detail.get("token")
+        entry = by_token.get(token) if token else None
+        if not isinstance(entry, dict):
+            return False
+        action = entry.get("action")
+        if action == "discard":
+            continue
+        if action in {"select_roster_name", "rename"} and (entry.get("name") or "").strip():
+            continue
+        return False
+    return True
+
+
+def _apply_roster_resolutions_to_parse_result(
+    batch: StaffingImportBatch, roster_res: Any
+) -> None:
+    """Rewrite or drop pending rows for resolved roster tokens."""
+    if not isinstance(roster_res, dict) or not batch.parse_result:
+        return
+    roster = get_roster()
+    rows_out: list[dict[str, Any]] = []
+    for row in list(batch.parse_result.get("rows") or []):
+        name = (row.get("person_name") or "").strip()
+        entry = roster_res.get(name)
+        if not isinstance(entry, dict):
+            rows_out.append(row)
+            continue
+        action = entry.get("action")
+        if action == "discard":
+            continue
+        new_name = (entry.get("name") or "").strip()
+        if action == "select_roster_name":
+            if new_name not in roster:
+                raise AppError(
+                    f"选定姓名「{new_name}」不在花名册中",
+                    status_code=400,
+                )
+            rows_out.append({**row, "person_name": new_name})
+        elif action == "rename":
+            if not new_name:
+                raise AppError("改名不能为空", status_code=400)
+            updated = {**row, "person_name": new_name}
+            if new_name not in roster:
+                entry["acknowledged_off_roster"] = True
+            rows_out.append(updated)
+        else:
+            raise AppError(f"未知花名册决议：{action}", status_code=400)
+    batch.parse_result = {**batch.parse_result, "rows": rows_out}
+
+
+def _rows_after_roster_resolution(
+    rows: list[dict[str, Any]], resolved: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Safety net on confirm: apply unresolved resolutions if rows still have tokens."""
+    by_token = _roster_unresolved_resolutions(resolved)
+    if not by_token:
+        return rows
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        name = (r.get("person_name") or "").strip()
+        entry = by_token.get(name)
+        if not isinstance(entry, dict):
+            out.append(r)
+            continue
+        action = entry.get("action")
+        if action == "discard":
+            continue
+        new_name = (entry.get("name") or "").strip()
+        if action in {"select_roster_name", "rename"} and new_name:
+            out.append({**r, "person_name": new_name})
+        else:
+            out.append(r)
+    return out
 
 
 def _is_collision_resolved(warnings: list, resolved: dict[str, Any]) -> bool:
@@ -258,10 +394,21 @@ def _open_warning_codes_from(
         code = w.get("code")
         if not code:
             continue
+        if code == "roster_name_corrected":
+            # Informational auto-fix; never blocks confirm.
+            continue
+        if code == "roster_unavailable":
+            # Must re-import after configuring roster; acknowledge is not enough.
+            open_codes.add(code)
+            continue
         if code in {"project_unmatched", "project_ambiguous"} and project_id:
             continue
         if code == "name_kind_collision":
             if not _is_collision_resolved(warnings, resolved):
+                open_codes.add(code)
+            continue
+        if code == "roster_name_unresolved":
+            if not _is_roster_unresolved_resolved(warnings, resolved):
                 open_codes.add(code)
             continue
         if code not in resolved:
@@ -315,6 +462,7 @@ async def confirm_batch(
         list((batch.parse_result or {}).get("rows") or []),
         batch.resolved_warnings or {},
     )
+    rows = _rows_after_roster_resolution(rows, batch.resolved_warnings or {})
     dates = {r["work_date"] for r in rows}
     date_objs = [date.fromisoformat(d) for d in dates]
 
@@ -389,7 +537,7 @@ async def confirm_batch(
 
 KIND_LABEL = {
     "internal_formal": "正式我司",
-    "internal_contract": "我司·外包性质",
+    "internal_contract": "机电服务处",
 }
 
 # Formal first, then contract; within kind by name.
@@ -420,9 +568,19 @@ async def project_summary(
                 "person_name": f.person_name,
                 "person_kind": f.person_kind,
                 "dates": set(),
+                "date_stages": {},
             },
         )
-        entry["dates"].add(f.work_date.isoformat())
+        iso = f.work_date.isoformat()
+        entry["dates"].add(iso)
+        stage = (f.stage or "").strip() or None
+        if stage and not entry["date_stages"].get(iso):
+            entry["date_stages"][iso] = stage
+        elif stage and entry["date_stages"].get(iso) and entry["date_stages"][iso] != stage:
+            # Keep first seen; conflicting stages on same day are rare after confirm.
+            pass
+        elif iso not in entry["date_stages"]:
+            entry["date_stages"][iso] = stage
 
     people = []
     all_dates: set[str] = set()
@@ -440,6 +598,9 @@ async def project_summary(
         key=lambda item: (_KIND_SORT.get(item[0][1], 9), item[0][0]),
     ):
         dates = sorted(entry["dates"])
+        date_stages = {
+            d: entry["date_stages"].get(d) for d in dates
+        }
         person_day_total += len(dates)
         all_dates.update(dates)
         by_kind_people.setdefault(kind, set()).add(name)
@@ -448,7 +609,8 @@ async def project_summary(
         # use synthetic keys for person-day totals per kind
         for d in dates:
             by_kind_days[kind].add(f"{name}:{d}")
-        stints = build_stints(dates)
+        stints = annotate_stints_with_stages(build_stints(dates), date_stages)
+        stages = stage_day_counts(date_stages)
         people.append(
             {
                 "person_name": name,
@@ -456,12 +618,79 @@ async def project_summary(
                 "person_kind_label": KIND_LABEL.get(kind, kind),
                 "days_on_site": len(dates),
                 "dates": dates,
+                "date_stages": date_stages,
+                "stages": stages,
                 "stint_count": len(stints),
                 "stints": stints,
             }
         )
 
     sorted_dates = sorted(all_dates)
+    name_split_suspects = [
+        {
+            "short_name": short,
+            "long_name": long,
+            "message": (
+                f"「{short}」与「{long}」疑似同一人被拆成两条"
+                "（常见于 PDF 换行/抽表），请复核后合并"
+            ),
+        }
+        for short, long in _suspected_name_split_pairs(
+            [p["person_name"] for p in people]
+        )
+    ]
+    roster = get_roster()
+    roster_name_suspects: list[dict[str, Any]] = []
+    seen_tokens: set[str] = set()
+    for p in people:
+        token = p["person_name"]
+        if token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        hit = classify_name_against_roster(token, roster=roster)
+        if hit["status"] == "exact":
+            continue
+        if hit["status"] == "unavailable":
+            roster_name_suspects.append(
+                {
+                    "token": token,
+                    "status": "unavailable",
+                    "person_kind": p["person_kind"],
+                    "person_kind_label": p["person_kind_label"],
+                    "message": "花名册不可用，无法校验该姓名",
+                    "candidates": [],
+                }
+            )
+            continue
+        if hit["status"] == "auto":
+            roster_name_suspects.append(
+                {
+                    "token": token,
+                    "status": "auto",
+                    "to_name": hit["to_name"],
+                    "person_kind": p["person_kind"],
+                    "person_kind_label": p["person_kind_label"],
+                    "message": (
+                        f"「{token}」可按花名册自动纠正为「{hit['to_name']}」"
+                        f"（{p['person_kind_label']}）"
+                    ),
+                    "candidates": hit.get("candidates") or [],
+                }
+            )
+        else:
+            roster_name_suspects.append(
+                {
+                    "token": token,
+                    "status": "unresolved",
+                    "person_kind": p["person_kind"],
+                    "person_kind_label": p["person_kind_label"],
+                    "message": (
+                        f"「{token}」无法在花名册中唯一确认"
+                        f"（{p['person_kind_label']}），请人工裁定"
+                    ),
+                    "candidates": hit.get("candidates") or [],
+                }
+            )
     return {
         "project_id": project_id,
         "project_code": proj.code if proj else "",
@@ -481,7 +710,172 @@ async def project_summary(
                 "person_day_total": len(by_kind_days.get("internal_contract") or ()),
             },
         },
+        "name_split_suspects": name_split_suspects,
+        "roster_name_suspects": roster_name_suspects,
         "label": "在场天数",
+    }
+
+
+async def repair_project_names_from_roster(
+    session: AsyncSession, *, principal: Principal, project_id: str
+) -> dict[str, Any]:
+    """Auto-rename active facts with a unique roster prefix/suffix match.
+
+    Applies to both 正式我司 and 机电服务处. Returns applied renames and still-
+    unresolved tokens (for manual adjudication).
+    """
+    await ensure_project_access(principal, project_id)
+    roster = get_roster()
+    if not roster:
+        raise AppError(
+            "人员信息花名册不可用，请配置 KB_STAFFING_ROSTER_PATH 后重试",
+            status_code=400,
+        )
+
+    facts = (
+        await session.execute(
+            select(StaffingAttendanceFact).where(
+                StaffingAttendanceFact.tenant_id == principal.tenant_id,
+                StaffingAttendanceFact.project_id == project_id,
+                StaffingAttendanceFact.status == "active",
+            )
+        )
+    ).scalars().all()
+    tokens = sorted({(f.person_name or "").strip() for f in facts if f.person_name})
+    applied: list[dict[str, str]] = []
+    unresolved: list[dict[str, Any]] = []
+    for token in tokens:
+        hit = classify_name_against_roster(token, roster=roster)
+        if hit["status"] == "exact":
+            continue
+        if hit["status"] == "auto":
+            result = await merge_person_names(
+                session,
+                principal=principal,
+                project_id=project_id,
+                from_name=token,
+                to_name=hit["to_name"],
+            )
+            applied.append(
+                {
+                    "from_name": token,
+                    "to_name": hit["to_name"],
+                    "renamed": int(result.get("renamed") or 0),
+                    "voided_duplicates": int(result.get("voided_duplicates") or 0),
+                }
+            )
+        else:
+            unresolved.append(
+                {
+                    "token": token,
+                    "candidates": hit.get("candidates") or [],
+                    "message": f"「{token}」无法在花名册中唯一确认，请人工裁定",
+                }
+            )
+
+    await _add_audit(
+        session,
+        tenant_id=principal.tenant_id,
+        actor=_actor(principal),
+        action="staffing.repair_roster_names",
+        resource_type="project",
+        resource_id=project_id,
+        detail={"applied": applied, "unresolved_count": len(unresolved)},
+    )
+    await session.commit()
+    return {
+        "project_id": project_id,
+        "applied": applied,
+        "unresolved": unresolved,
+        "applied_count": len(applied),
+        "unresolved_count": len(unresolved),
+    }
+
+
+async def merge_person_names(
+    session: AsyncSession,
+    *,
+    principal: Principal,
+    project_id: str,
+    from_name: str,
+    to_name: str,
+) -> dict[str, Any]:
+    """Rename active facts from ``from_name`` to ``to_name`` within a project.
+
+    When the long name already has an active fact on the same day+kind, the
+    short-name fact is voided instead of violating the batch uniqueness.
+    """
+    await ensure_project_access(principal, project_id)
+    short = (from_name or "").strip()
+    long = (to_name or "").strip()
+    if not short or not long or short == long:
+        raise AppError("合并姓名无效", status_code=400)
+
+    short_facts = list(
+        (
+            await session.execute(
+                select(StaffingAttendanceFact).where(
+                    StaffingAttendanceFact.tenant_id == principal.tenant_id,
+                    StaffingAttendanceFact.project_id == project_id,
+                    StaffingAttendanceFact.status == "active",
+                    StaffingAttendanceFact.person_name == short,
+                )
+            )
+        ).scalars().all()
+    )
+    if not short_facts:
+        raise AppError(f"未找到姓名「{short}」的有效出勤", status_code=404)
+
+    long_keys = {
+        (f.batch_id, f.work_date, f.person_kind)
+        for f in (
+            await session.execute(
+                select(StaffingAttendanceFact).where(
+                    StaffingAttendanceFact.tenant_id == principal.tenant_id,
+                    StaffingAttendanceFact.project_id == project_id,
+                    StaffingAttendanceFact.status == "active",
+                    StaffingAttendanceFact.person_name == long,
+                )
+            )
+        ).scalars().all()
+    }
+
+    renamed = 0
+    voided = 0
+    now = _utcnow()
+    for fact in short_facts:
+        key = (fact.batch_id, fact.work_date, fact.person_kind)
+        if key in long_keys:
+            fact.status = "voided"
+            fact.void_reason = "merged_name_duplicate"
+            fact.voided_by = principal.user_id
+            fact.voided_at = now
+            voided += 1
+            continue
+        fact.person_name = long
+        long_keys.add(key)
+        renamed += 1
+
+    await _add_audit(
+        session,
+        tenant_id=principal.tenant_id,
+        actor=_actor(principal),
+        action="staffing.merge_names",
+        resource_type="project",
+        resource_id=project_id,
+        detail={
+            "from_name": short,
+            "to_name": long,
+            "renamed": renamed,
+            "voided_duplicates": voided,
+        },
+    )
+    await session.commit()
+    return {
+        "from_name": short,
+        "to_name": long,
+        "renamed": renamed,
+        "voided_duplicates": voided,
     }
 
 
@@ -584,156 +978,101 @@ async def void_facts(
     return len(facts)
 
 
+# Columns match desktop「人员投入汇总表总表」layout (one row per person-day).
+_EXPORT_HEADERS = [
+    "序号",
+    "日期",
+    "姓名",
+    "项目号",
+    "项目阶段",
+    "部门",
+    "职务",
+    "项目名称",
+]
+_EXPORT_DATE_FORMAT = "mm-dd-yy"
+_EXPORT_COL_WIDTHS = {
+    "A": 8.125,
+    "B": 13.125,
+    "C": 12.625,
+    "D": 10.25,
+    "E": 13.0,
+    "F": 14.125,
+    "G": 21.875,
+    "H": 51.0,
+}
+
+
 async def export_project_xlsx(
     session: AsyncSession, *, principal: Principal, project_id: str
 ) -> bytes:
-    """Build workbook with 汇总 + 工期段 + 明细 sheets for an authorized project."""
+    """Build workbook matching 人员投入汇总表总表 (person × day rows)."""
     import io
 
     from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
 
-    summary = await project_summary(session, principal=principal, project_id=project_id)
+    from app.staffing.roster import get_roster, resolve_department_title
+
+    await ensure_project_access(principal, project_id)
+    proj = await session.get(Project, project_id)
+    if proj is None or proj.tenant_id != principal.tenant_id:
+        raise NotFoundError("项目不存在")
+
     facts = await list_facts(
         session, principal=principal, project_id=project_id, include_voided=False
     )
-    people = list(summary.get("people") or [])
-    max_stints = max(
-        (len(p.get("stints") or []) or int(p.get("stint_count") or 0) for p in people),
-        default=0,
-    )
-    emit_numbered = 0 < max_stints <= 5
+    roster = get_roster()
+    project_code = proj.code or ""
+    # Prefer numeric project code when the workbook stores 项目号 as number.
+    try:
+        project_no: Any = int(str(project_code).strip()) if str(project_code).strip() else ""
+    except ValueError:
+        project_no = project_code
+    project_name = proj.name or ""
 
-    wb = Workbook()
-    ws_sum = wb.active
-    ws_sum.title = "汇总"
-    ws_sum.append(
-        [
-            "项目编号",
-            summary.get("project_code") or "",
-            "项目名称",
-            summary.get("project_name") or "",
-        ]
-    )
-    ws_sum.append(
-        [
-            "日期起",
-            summary.get("date_from") or "",
-            "日期止",
-            summary.get("date_to") or "",
-        ]
-    )
-    ws_sum.append(
-        [
-            "人数",
-            summary.get("person_count") or 0,
-            "人天合计",
-            summary.get("person_day_total") or 0,
-        ]
-    )
-    by_kind = summary.get("by_kind") or {}
-    formal = by_kind.get("formal") or {}
-    contract = by_kind.get("contract") or {}
-    ws_sum.append(
-        [
-            "正式人数",
-            formal.get("person_count") or 0,
-            "正式人天",
-            formal.get("person_day_total") or 0,
-        ]
-    )
-    ws_sum.append(
-        [
-            "外包性质人数",
-            contract.get("person_count") or 0,
-            "外包性质人天",
-            contract.get("person_day_total") or 0,
-        ]
-    )
-    ws_sum.append([])
-    header = ["姓名", "身份", "在场天数", "进场次数", "在场摘要"]
-    if emit_numbered:
-        for i in range(1, max_stints + 1):
-            header.extend([f"第{i}段入", f"第{i}段出", f"第{i}段天数"])
-    ws_sum.append(header)
-    for p in people:
-        stints = list(p.get("stints") or [])
-        if not stints and p.get("dates"):
-            stints = build_stints(list(p.get("dates") or []))
-        stint_count = len(stints) or int(p.get("stint_count") or 0)
-        row = [
-            p.get("person_name"),
-            p.get("person_kind_label") or KIND_LABEL.get(p.get("person_kind"), ""),
-            p.get("days_on_site"),
-            stint_count,
-            format_stints_summary(stints),
-        ]
-        if emit_numbered:
-            for i in range(1, max_stints + 1):
-                s = stints[i - 1] if i <= len(stints) else None
-                row.extend(
-                    [
-                        (s or {}).get("entry_date") or "",
-                        (s or {}).get("exit_date") or "",
-                        (s or {}).get("days") or "",
-                    ]
-                )
-        ws_sum.append(row)
-
-    ws_stint = wb.create_sheet("工期段")
-    ws_stint.append(
-        ["姓名", "身份", "第几次进场", "入场日", "离场日", "本段天数", "累计在场天数"]
-    )
-    for p in people:
-        stints = list(p.get("stints") or [])
-        if not stints and p.get("dates"):
-            stints = build_stints(list(p.get("dates") or []))
-        kind_label = p.get("person_kind_label") or KIND_LABEL.get(
-            p.get("person_kind"), ""
-        )
-        if not stints:
-            ws_stint.append(
-                [
-                    p.get("person_name"),
-                    kind_label,
-                    "",
-                    "",
-                    "",
-                    "",
-                    p.get("days_on_site") or 0,
-                ]
-            )
-            continue
-        for s in stints:
-            ws_stint.append(
-                [
-                    p.get("person_name"),
-                    kind_label,
-                    s.get("index"),
-                    s.get("entry_date"),
-                    s.get("exit_date"),
-                    s.get("days"),
-                    p.get("days_on_site") or 0,
-                ]
-            )
-
-    ws_detail = wb.create_sheet("明细")
-    ws_detail.append(["工作日", "姓名", "身份"])
     sorted_facts = sorted(
         facts,
-        key=lambda f: (
-            _KIND_SORT.get(f.person_kind, 9),
-            f.person_name,
-            f.work_date,
-        ),
+        key=lambda f: (f.work_date, f.person_name or "", _KIND_SORT.get(f.person_kind, 9)),
     )
-    for f in sorted_facts:
-        ws_detail.append(
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "人员投入汇总表"
+    ws.append(list(_EXPORT_HEADERS))
+
+    header_font = Font(size=11.25)
+    header_fill = PatternFill(fill_type="solid", fgColor="FFFFFFFF")
+    for col in range(1, len(_EXPORT_HEADERS) + 1):
+        cell = ws.cell(1, col)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    body_font = Font(size=11.25)
+    for idx, f in enumerate(sorted_facts, start=1):
+        dept, title = resolve_department_title(
+            f.person_name or "", f.person_kind, roster=roster
+        )
+        ws.append(
             [
-                f.work_date.isoformat(),
-                f.person_name,
-                KIND_LABEL.get(f.person_kind, f.person_kind),
+                idx,
+                f.work_date,
+                f.person_name or "",
+                project_no,
+                (f.stage or "").strip(),
+                dept,
+                title,
+                project_name,
             ]
         )
+        for col in range(1, len(_EXPORT_HEADERS) + 1):
+            cell = ws.cell(ws.max_row, col)
+            cell.font = body_font
+            if col == 2:
+                cell.number_format = _EXPORT_DATE_FORMAT
+
+    for letter, width in _EXPORT_COL_WIDTHS.items():
+        ws.column_dimensions[letter].width = width
 
     buf = io.BytesIO()
     wb.save(buf)

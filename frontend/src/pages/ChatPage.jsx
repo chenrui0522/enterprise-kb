@@ -1,15 +1,20 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import BrandLogo, { BRAND_PRODUCT_NAME } from "../BrandLogo.jsx";
 import {
   chatToolAction,
   createConversation,
+  deleteConversation,
+  exportLeaveLedgerXlsx,
   exportStaffingXlsx,
   getConversationMemory,
   getMessages,
+  getStaffingSummary,
   listChatTools,
   listConversations,
   listMyStaffingProjects,
+  mergeStaffingNames,
+  repairStaffingRosterNames,
   streamChat,
   submitFeedback,
   updateConversationTitle,
@@ -27,6 +32,103 @@ const SUGGESTIONS = [
 
 const STORAGE_KEY = "kb:lastConversationId";
 
+/** Prefer live project summary so stage fields stay current on old chat cards. */
+function LiveStaffingSummary({ card }) {
+  const [summary, setSummary] = useState(card);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [mergeBusy, setMergeBusy] = useState(false);
+  const [repairBusy, setRepairBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    const projectId = card?.project_id;
+    if (!projectId) {
+      setSummary(card);
+      return undefined;
+    }
+    let cancelled = false;
+    getStaffingSummary(projectId)
+      .then((live) => {
+        if (!cancelled) setSummary({ ...card, ...live, type: "staffing_summary" });
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setSummary(card);
+          setError(err.message || "刷新汇总失败，显示会话内缓存");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [card?.project_id, tick]);
+
+  return (
+    <div className="tool-card">
+      {error ? <p className="muted tool-card-hint">{error}</p> : null}
+      <StaffingSummaryPanel
+        summary={summary}
+        compact
+        exportBusy={exportBusy}
+        mergeBusy={mergeBusy}
+        repairBusy={repairBusy}
+        onMergeNames={
+          summary?.project_id
+            ? async (fromName, toName) => {
+                setMergeBusy(true);
+                setError("");
+                try {
+                  await mergeStaffingNames(summary.project_id, fromName, toName);
+                  setTick((n) => n + 1);
+                } catch (err) {
+                  setError(err.message || "合并失败");
+                } finally {
+                  setMergeBusy(false);
+                }
+              }
+            : undefined
+        }
+        onRepairRosterNames={
+          summary?.project_id
+            ? async () => {
+                setRepairBusy(true);
+                setError("");
+                try {
+                  const result = await repairStaffingRosterNames(summary.project_id);
+                  setTick((n) => n + 1);
+                  if (result.unresolved_count) {
+                    setError(
+                      `已自动纠正 ${result.applied_count} 个；仍有 ${result.unresolved_count} 个需人工裁定`,
+                    );
+                  }
+                } catch (err) {
+                  setError(err.message || "花名册纠名失败");
+                } finally {
+                  setRepairBusy(false);
+                }
+              }
+            : undefined
+        }
+        onExport={
+          summary?.project_id
+            ? async () => {
+                setExportBusy(true);
+                try {
+                  await exportStaffingXlsx(summary.project_id);
+                } catch (err) {
+                  setError(err.message || "导出失败");
+                } finally {
+                  setExportBusy(false);
+                }
+              }
+            : undefined
+        }
+      />
+    </div>
+  );
+}
+
 function RichText({ text }) {
   const parts = String(text || "").split(/\*\*(.+?)\*\*/g);
   return parts.map((part, index) => (index % 2 === 1 ? <strong key={index}>{part}</strong> : part));
@@ -35,6 +137,8 @@ function RichText({ text }) {
 function StaffingBatchCard({ card, disabled, onConfirm }) {
   const needsProject = !card.project_id;
   const collisions = card.collisions || [];
+  const rosterUnresolved = card.roster_unresolved || [];
+  const rosterUnavailable = Boolean(card.roster_unavailable);
   const [projects, setProjects] = useState([]);
   const [projectId, setProjectId] = useState(card.project_id || "");
   const [loadError, setLoadError] = useState("");
@@ -45,6 +149,7 @@ function StaffingBatchCard({ card, disabled, onConfirm }) {
     }
     return init;
   });
+  const [rosterChoices, setRosterChoices] = useState({});
 
   useEffect(() => {
     if (!needsProject) return undefined;
@@ -78,6 +183,19 @@ function StaffingBatchCard({ card, disabled, onConfirm }) {
       if (choice.action === "split") return true;
       return choice.action === "merge" && choice.keep_kind;
     });
+
+  const rosterReady =
+    !rosterUnavailable &&
+    (rosterUnresolved.length === 0 ||
+      rosterUnresolved.every((r) => {
+        const choice = rosterChoices[r.token];
+        if (!choice) return false;
+        if (choice.action === "discard") return true;
+        return (
+          (choice.action === "select_roster_name" || choice.action === "rename") &&
+          Boolean(choice.name)
+        );
+      }));
 
   const setCollisionAction = (name, action) => {
     setCollisionChoices((prev) => ({
@@ -164,9 +282,83 @@ function StaffingBatchCard({ card, disabled, onConfirm }) {
                       }
                     >
                       <option value="internal_formal">正式我司</option>
-                      <option value="internal_contract">我司·外包性质</option>
+                      <option value="internal_contract">机电服务处</option>
                     </select>
                   ) : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+      {rosterUnavailable ? (
+        <p className="tool-card-error">
+          人员信息花名册不可用，请配置 KB_STAFFING_ROSTER_PATH 后重新导入。
+        </p>
+      ) : null}
+      {rosterUnresolved.length ? (
+        <div className="tool-card-collisions">
+          <div className="collision-name">花名册无法确认</div>
+          {rosterUnresolved.map((r) => {
+            const choice = rosterChoices[r.token] || {};
+            return (
+              <div className="collision-row" key={r.token}>
+                <div className="collision-name">{r.token}</div>
+                <p className="muted">{r.message}</p>
+                <div className="collision-actions">
+                  {(r.candidates || []).length ? (
+                    <label>
+                      选定
+                      <select
+                        value={choice.action === "select_roster_name" ? choice.name || "" : ""}
+                        disabled={disabled}
+                        onChange={(e) => {
+                          const name = e.target.value;
+                          if (!name) return;
+                          setRosterChoices((prev) => ({
+                            ...prev,
+                            [r.token]: { action: "select_roster_name", name },
+                          }));
+                        }}
+                      >
+                        <option value="">请选择</option>
+                        {r.candidates.map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  <label>
+                    改名
+                    <input
+                      type="text"
+                      disabled={disabled}
+                      value={choice.action === "rename" ? choice.name || "" : ""}
+                      onChange={(e) =>
+                        setRosterChoices((prev) => ({
+                          ...prev,
+                          [r.token]: { action: "rename", name: e.target.value },
+                        }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <input
+                      type="radio"
+                      name={`chat-roster-discard-${r.token}`}
+                      disabled={disabled}
+                      checked={choice.action === "discard"}
+                      onChange={() =>
+                        setRosterChoices((prev) => ({
+                          ...prev,
+                          [r.token]: { action: "discard" },
+                        }))
+                      }
+                    />
+                    丢弃
+                  </label>
                 </div>
               </div>
             );
@@ -176,7 +368,13 @@ function StaffingBatchCard({ card, disabled, onConfirm }) {
       {card.warnings?.length ? (
         <ul className="tool-card-list">
           {card.warnings
-            .filter((w) => w.code !== "name_kind_collision")
+            .filter(
+              (w) =>
+                w.code !== "name_kind_collision" &&
+                w.code !== "roster_name_unresolved" &&
+                w.code !== "roster_unavailable" &&
+                w.code !== "roster_name_corrected",
+            )
             .slice(0, 8)
             .map((w, i) => (
               <li key={`${w.code}-${i}`}>
@@ -193,19 +391,433 @@ function StaffingBatchCard({ card, disabled, onConfirm }) {
             disabled={
               disabled ||
               (a.id === "ack_and_confirm" &&
-                ((needsProject && !projectId) || !collisionsReady))
+                ((needsProject && !projectId) || !collisionsReady || !rosterReady))
             }
             onClick={() =>
               onConfirm(a.id, {
                 batch_id: card.batch_id,
                 project_id: projectId || card.project_id || null,
                 name_kind_collision: collisions.length ? collisionChoices : undefined,
+                roster_name_unresolved: rosterUnresolved.length
+                  ? rosterChoices
+                  : undefined,
               })
             }
           >
             {a.label}
           </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function leaveWarningStillOpen(w, resolved) {
+  if (w.blocking === false) return false;
+  const code = w.code || "";
+  const detail = w.detail || {};
+  if (code.startsWith("missing_source_")) {
+    const role = detail.role || code.replace("missing_source_", "");
+    return resolved.missing_sources?.[role] !== "accept";
+  }
+  if (code === "approval_not_passed") {
+    const key = detail.key || "";
+    return !["include", "exclude"].includes(resolved.approval_not_passed?.[key]);
+  }
+  if (code === "ot_half_day_mismatch" || code === "ot_missing_punch") {
+    const key = `${detail.person}:${detail.date}`;
+    return !["accept_full", "accept_half", "exclude"].includes(resolved[code]?.[key]);
+  }
+  if (code === "hq_address_unknown") {
+    const key = `${detail.person}:${detail.start}:${detail.end}`;
+    return resolved.hq_address_unknown?.[key] !== "accept";
+  }
+  return !resolved[code];
+}
+
+function mergeLeaveResolutions(base, local) {
+  const out = { ...(base || {}) };
+  for (const [k, v] of Object.entries(local || {})) {
+    if (v && typeof v === "object" && !Array.isArray(v) && out[k] && typeof out[k] === "object") {
+      out[k] = { ...out[k], ...v };
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function LeaveLedgerJobCard({ card, disabled, onAction }) {
+  const [error, setError] = useState("");
+  const [exportBusy, setExportBusy] = useState(false);
+  const [resolutions, setResolutions] = useState({});
+  const [busy, setBusy] = useState(false);
+
+  const roles = card.roles || [];
+  const needRolePick = Boolean(card.need_role_pick);
+  const mergedResolved = useMemo(
+    () => mergeLeaveResolutions(card.resolved_warnings, resolutions),
+    [card.resolved_warnings, resolutions]
+  );
+  const openWarnings = useMemo(
+    () => (card.warnings || []).filter((w) => leaveWarningStillOpen(w, mergedResolved)),
+    [card.warnings, mergedResolved]
+  );
+  const otMissing = openWarnings.filter((w) => w.code === "ot_missing_punch");
+  const otHalf = openWarnings.filter((w) => w.code === "ot_half_day_mismatch");
+  const hasLocalResolutions = Object.keys(resolutions).length > 0;
+  const serverOpenCount =
+    typeof card.open_blocking_count === "number" ? card.open_blocking_count : null;
+  // After local edits, trust the filtered list; otherwise prefer server count so a
+  // truncated/stale card cannot enable confirm while confirm_job would still fail.
+  const pendingCount = hasLocalResolutions
+    ? openWarnings.length
+    : serverOpenCount != null
+      ? serverOpenCount
+      : openWarnings.length;
+  const canConfirm =
+    !needRolePick &&
+    (card.status === "parsed" || card.status === "needs_review") &&
+    pendingCount === 0;
+
+  const acceptMissing = (role) => {
+    setResolutions((prev) => ({
+      ...prev,
+      missing_sources: { ...(prev.missing_sources || {}), [role]: "accept" },
+    }));
+  };
+
+  const resolveApproval = (key, action) => {
+    setResolutions((prev) => ({
+      ...prev,
+      approval_not_passed: { ...(prev.approval_not_passed || {}), [key]: action },
+    }));
+  };
+
+  const resolveOt = (code, key, action) => {
+    setResolutions((prev) => ({
+      ...prev,
+      [code]: { ...(prev[code] || {}), [key]: action },
+    }));
+  };
+
+  const bulkResolveOt = (code, action) => {
+    const list = openWarnings.filter((w) => w.code === code);
+    if (!list.length) return;
+    setResolutions((prev) => {
+      const bucket = { ...(prev[code] || {}) };
+      for (const w of list) {
+        const d = w.detail || {};
+        bucket[`${d.person}:${d.date}`] = action;
+      }
+      return { ...prev, [code]: bucket };
+    });
+  };
+
+  const run = async (action, payload = {}) => {
+    setError("");
+    setBusy(true);
+    try {
+      await onAction(action, {
+        job_id: card.job_id,
+        ...payload,
+      });
+      setResolutions({});
+    } catch (err) {
+      setError(err.message || "操作失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onExport = async () => {
+    setExportBusy(true);
+    setError("");
+    try {
+      await run("leave_ledger.export", {});
+      const blob = await exportLeaveLedgerXlsx(card.job_id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `调休台账-${card.job_id}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err.message || "导出失败");
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const onSubmitReview = async () => {
+    if (!hasLocalResolutions) return;
+    await run("leave_ledger.review", { resolutions });
+  };
+
+  const onConfirm = async () => {
+    if (!window.confirm("确认将该调休台账标记为已确认？确认后可导出正式台账。")) return;
+    await run("leave_ledger.confirm", {
+      confirmed: true,
+      resolutions: hasLocalResolutions ? resolutions : undefined,
+    });
+  };
+
+  const onVoid = async () => {
+    if (!window.confirm("确认作废该调休台账任务？此操作不可撤销。")) return;
+    await run("leave_ledger.void", { confirmed: true, reason: "对话中作废" });
+  };
+
+  const actionsDisabled = disabled || busy || exportBusy;
+
+  return (
+    <div className="tool-card">
+      <div className="tool-card-title">调休台账 · 任务进度</div>
+      <p className="muted">
+        {card.job_id?.slice(0, 8)}… · {card.status}
+        {pendingCount ? ` · 待决议 ${pendingCount}` : ""}
+        {card.row_count != null ? ` · ${card.row_count} 人` : ""}
+      </p>
+      {card.note ? <p className="muted tool-card-hint">{card.note}</p> : null}
+      {card.pending_filename ? (
+        <p className="tool-card-hint">待指定角色：{card.pending_filename}</p>
+      ) : null}
+      <ul className="tool-card-list">
+        {roles.map((r) => (
+          <li key={r.role}>
+            {r.filled ? "✓" : "○"} {r.label}
+            {r.filename ? ` · ${r.filename}` : " · 未上传"}
+          </li>
+        ))}
+      </ul>
+      {pendingCount > 0 && openWarnings.length === 0 ? (
+        <p className="tool-card-error">
+          仍有 {pendingCount} 条未决议告警未展示在本卡片中。请重新触发任务卡片，或打开调休台账页处理。
+        </p>
+      ) : null}
+      {openWarnings.length ? (
+        <>
+          <p className="muted tool-card-hint">
+            确认前须处理下列告警（可先批量处理同类项）。
+          </p>
+          <div className="tool-card-actions">
+            {otMissing.length ? (
+              <>
+                <button
+                  type="button"
+                  disabled={actionsDisabled}
+                  onClick={() => bulkResolveOt("ot_missing_punch", "exclude")}
+                >
+                  缺打卡全部排除（{otMissing.length}）
+                </button>
+                <button
+                  type="button"
+                  disabled={actionsDisabled}
+                  onClick={() => bulkResolveOt("ot_missing_punch", "accept_full")}
+                >
+                  缺打卡全部按满日记
+                </button>
+              </>
+            ) : null}
+            {otHalf.length ? (
+              <>
+                <button
+                  type="button"
+                  disabled={actionsDisabled}
+                  onClick={() => bulkResolveOt("ot_half_day_mismatch", "exclude")}
+                >
+                  半天不符全部排除（{otHalf.length}）
+                </button>
+                <button
+                  type="button"
+                  disabled={actionsDisabled}
+                  onClick={() => bulkResolveOt("ot_half_day_mismatch", "accept_full")}
+                >
+                  半天不符全部按满日记
+                </button>
+              </>
+            ) : null}
+            {openWarnings.some((w) => w.code === "approval_not_passed") ? (
+              <>
+                <button
+                  type="button"
+                  disabled={actionsDisabled}
+                  onClick={() => {
+                    const list = openWarnings.filter((w) => w.code === "approval_not_passed");
+                    setResolutions((prev) => {
+                      const bucket = { ...(prev.approval_not_passed || {}) };
+                      for (const w of list) {
+                        const key = (w.detail || {}).key || "";
+                        if (key) bucket[key] = "exclude";
+                      }
+                      return { ...prev, approval_not_passed: bucket };
+                    });
+                  }}
+                >
+                  未通过审批全部排除
+                </button>
+              </>
+            ) : null}
+          </div>
+          <ul className="tool-card-list">
+            {openWarnings.slice(0, 40).map((w, i) => {
+              const detail = w.detail || {};
+              const code = w.code || "";
+              const hasSpecial =
+                code.startsWith("missing_source_") ||
+                code === "approval_not_passed" ||
+                code === "ot_half_day_mismatch" ||
+                code === "ot_missing_punch" ||
+                code === "hq_address_unknown";
+              return (
+                <li key={`${code}-${i}`}>
+                  <div>
+                    <strong>{code}</strong> — {w.message}
+                  </div>
+                  {code.startsWith("missing_source_") ? (
+                    <button
+                      type="button"
+                      className="linkish"
+                      disabled={actionsDisabled}
+                      onClick={() => {
+                        const role = detail.role || code.replace("missing_source_", "");
+                        acceptMissing(role);
+                      }}
+                    >
+                      接受缺失
+                    </button>
+                  ) : null}
+                  {code === "approval_not_passed" ? (
+                    <span className="tool-card-actions">
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() => resolveApproval(detail.key || "", "include")}
+                      >
+                        纳入
+                      </button>
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() => resolveApproval(detail.key || "", "exclude")}
+                      >
+                        排除
+                      </button>
+                    </span>
+                  ) : null}
+                  {code === "ot_half_day_mismatch" || code === "ot_missing_punch" ? (
+                    <span className="tool-card-actions">
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          resolveOt(code, `${detail.person}:${detail.date}`, "exclude")
+                        }
+                      >
+                        排除该日
+                      </button>
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          resolveOt(code, `${detail.person}:${detail.date}`, "accept_half")
+                        }
+                      >
+                        按半日记
+                      </button>
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          resolveOt(code, `${detail.person}:${detail.date}`, "accept_full")
+                        }
+                      >
+                        按满日记
+                      </button>
+                    </span>
+                  ) : null}
+                  {code === "hq_address_unknown" ? (
+                    <button
+                      type="button"
+                      className="linkish"
+                      disabled={actionsDisabled}
+                      onClick={() =>
+                        setResolutions((prev) => ({
+                          ...prev,
+                          hq_address_unknown: {
+                            ...(prev.hq_address_unknown || {}),
+                            [`${detail.person}:${detail.start}:${detail.end}`]: "accept",
+                          },
+                        }))
+                      }
+                    >
+                      已知晓
+                    </button>
+                  ) : null}
+                  {!hasSpecial ? (
+                    <button
+                      type="button"
+                      className="linkish"
+                      disabled={actionsDisabled}
+                      onClick={() =>
+                        setResolutions((prev) => ({
+                          ...prev,
+                          [code]: true,
+                        }))
+                      }
+                    >
+                      已知晓
+                    </button>
+                  ) : null}
+                </li>
+              );
+            })}
+            {openWarnings.length > 40 ? (
+              <li className="muted">另有 {openWarnings.length - 40} 条，请用上方批量按钮处理。</li>
+            ) : null}
+          </ul>
+        </>
+      ) : null}
+      {error ? <p className="tool-card-error">{error}</p> : null}
+      <div className="tool-card-actions">
+        {needRolePick
+          ? (card.actions || [])
+              .filter((a) => String(a.id).startsWith("leave_ledger.pick_role"))
+              .map((a) => (
+                <button
+                  key={a.id}
+                  type="button"
+                  disabled={actionsDisabled}
+                  onClick={() => run(a.id, { role: a.id.split(":")[1] })}
+                >
+                  {a.label}
+                </button>
+              ))
+          : null}
+        {!needRolePick && hasLocalResolutions ? (
+          <button type="button" disabled={actionsDisabled} onClick={onSubmitReview}>
+            提交复核决议
+          </button>
+        ) : null}
+        {!needRolePick && canConfirm ? (
+          <button type="button" disabled={actionsDisabled} onClick={onConfirm}>
+            确认台账
+          </button>
+        ) : null}
+        {!needRolePick && card.status === "confirmed" ? (
+          <button type="button" disabled={actionsDisabled} onClick={onExport}>
+            {exportBusy ? "导出中…" : "导出 Excel"}
+          </button>
+        ) : null}
+        {!needRolePick && card.status !== "voided" ? (
+          <button type="button" disabled={actionsDisabled} onClick={onVoid}>
+            作废
+          </button>
+        ) : null}
       </div>
     </div>
   );
@@ -227,7 +839,9 @@ export default function ChatPage() {
   const [conversationTitle, setConversationTitle] = useState("新对话");
   const [editingTitleId, setEditingTitleId] = useState(null);
   const [editingTitleDraft, setEditingTitleDraft] = useState("");
+  const [editingTitleSurface, setEditingTitleSurface] = useState(null); // "list" | "header"
   const editingTitleIdRef = useRef(null);
+  const editingTitleDraftRef = useRef("");
   const [messages, setMessages] = useState([]);
   const [memory, setMemory] = useState(null);
   const [sessionError, setSessionError] = useState("");
@@ -344,23 +958,29 @@ export default function ChatPage() {
     setActiveTool("");
     setConversations(rows);
     setEditingTitleId(null);
+    setEditingTitleSurface(null);
   };
 
-  const beginRename = (conversation) => {
+  const beginRename = (conversation, surface = "list") => {
     editingTitleIdRef.current = conversation.id;
+    const draft = conversation.title || "新对话";
+    editingTitleDraftRef.current = draft;
     setEditingTitleId(conversation.id);
-    setEditingTitleDraft(conversation.title || "新对话");
+    setEditingTitleDraft(draft);
+    setEditingTitleSurface(surface);
   };
 
   const cancelRename = () => {
     editingTitleIdRef.current = null;
+    editingTitleDraftRef.current = "";
     setEditingTitleId(null);
+    setEditingTitleSurface(null);
   };
 
   const commitRename = async () => {
     const id = editingTitleIdRef.current;
     if (!id) return;
-    const next = (editingTitleDraft || "").trim();
+    const next = (editingTitleDraftRef.current || "").trim();
     if (!next) {
       setSessionError("标题不能为空");
       cancelRename();
@@ -375,6 +995,7 @@ export default function ChatPage() {
     }
     editingTitleIdRef.current = null;
     setEditingTitleId(null);
+    setEditingTitleSurface(null);
     try {
       const updated = await updateConversationTitle(id, next);
       setConversations((rows) =>
@@ -387,13 +1008,33 @@ export default function ChatPage() {
     }
   };
 
+  const onDeleteConversation = async (conversation) => {
+    if (!conversation?.id) return;
+    const title = conversation.title || "新对话";
+    if (!window.confirm(`确认删除「${title}」？删除后不可恢复。`)) return;
+    try {
+      await deleteConversation(conversation.id);
+      setConversations((rows) => rows.filter((c) => c.id !== conversation.id));
+      if (conversation.id === conversationId) {
+        applyConversationId(null);
+        setConversationTitle("新对话");
+        setMessages([]);
+        setMemory(null);
+        setAttachment(null);
+      }
+      setSessionError("");
+    } catch (err) {
+      setSessionError(err.message || "删除失败");
+    }
+  };
+
   const onPickAttachment = async (event) => {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
     const lower = (file.name || "").toLowerCase();
-    if (!lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
-      setSessionError("仅支持 Excel（.xlsx）附件");
+    if (!lower.endsWith(".xlsx") && !lower.endsWith(".xls") && !lower.endsWith(".pdf")) {
+      setSessionError("仅支持 Excel（.xlsx）或由该工作簿导出的 PDF");
       return;
     }
     setAttachBusy(true);
@@ -549,12 +1190,15 @@ export default function ChatPage() {
               key={conversation.id}
               className={`conversation-item ${conversation.id === conversationId ? "active" : ""}`}
             >
-              {editingTitleId === conversation.id ? (
+              {editingTitleId === conversation.id && editingTitleSurface === "list" ? (
                 <input
                   className="conversation-title-input"
                   value={editingTitleDraft}
                   autoFocus
-                  onChange={(e) => setEditingTitleDraft(e.target.value)}
+                  onChange={(e) => {
+                    editingTitleDraftRef.current = e.target.value;
+                    setEditingTitleDraft(e.target.value);
+                  }}
                   onBlur={() => {
                     window.setTimeout(() => {
                       if (editingTitleIdRef.current === conversation.id) commitRename();
@@ -598,10 +1242,22 @@ export default function ChatPage() {
                     aria-label="改名"
                     onClick={(e) => {
                       e.stopPropagation();
-                      beginRename(conversation);
+                      beginRename(conversation, "list");
                     }}
                   >
                     改名
+                  </button>
+                  <button
+                    type="button"
+                    className="conversation-delete-btn"
+                    title="删除"
+                    aria-label="删除"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteConversation(conversation);
+                    }}
+                  >
+                    删除
                   </button>
                 </>
               )}
@@ -629,12 +1285,15 @@ export default function ChatPage() {
       <main className="chat-main">
         {conversationId && (
           <header className="chat-header">
-            {editingTitleId === conversationId ? (
+            {editingTitleId === conversationId && editingTitleSurface === "header" ? (
               <input
                 className="chat-title-input"
                 value={editingTitleDraft}
                 autoFocus
-                onChange={(e) => setEditingTitleDraft(e.target.value)}
+                onChange={(e) => {
+                  editingTitleDraftRef.current = e.target.value;
+                  setEditingTitleDraft(e.target.value);
+                }}
                 onBlur={() => {
                   window.setTimeout(() => {
                     if (editingTitleIdRef.current === conversationId) commitRename();
@@ -653,12 +1312,16 @@ export default function ChatPage() {
               />
             ) : (
               <div className="chat-title-row">
-                <span className="chat-title">{conversationTitle || "新对话"}</span>
+                <span className="chat-title">
+                  {editingTitleId === conversationId
+                    ? editingTitleDraft
+                    : conversationTitle || "新对话"}
+                </span>
                 <button
                   type="button"
                   className="chat-rename-btn"
                   onClick={() =>
-                    beginRename({ id: conversationId, title: conversationTitle })
+                    beginRename({ id: conversationId, title: conversationTitle }, "header")
                   }
                 >
                   改名
@@ -705,23 +1368,14 @@ export default function ChatPage() {
                           />
                         ) : null}
                         {message.meta?.card?.type === "staffing_summary" ? (
-                          <div className="tool-card">
-                            <StaffingSummaryPanel
-                              summary={message.meta.card}
-                              compact
-                              onExport={
-                                message.meta.card.project_id
-                                  ? async () => {
-                                      try {
-                                        await exportStaffingXlsx(message.meta.card.project_id);
-                                      } catch (err) {
-                                        setSessionError(err.message || "导出失败");
-                                      }
-                                    }
-                                  : undefined
-                              }
-                            />
-                          </div>
+                          <LiveStaffingSummary card={message.meta.card} />
+                        ) : null}
+                        {message.meta?.card?.type === "leave_ledger_job" ? (
+                          <LeaveLedgerJobCard
+                            card={message.meta.card}
+                            disabled={loading}
+                            onAction={(action, payload) => runToolAction(action, payload)}
+                          />
                         ) : null}
                         {message.citations?.length > 0 && (
                           <div className="citations">
@@ -817,10 +1471,10 @@ export default function ChatPage() {
               }}
             />
             <div className="composer-tools">
-              <label className="composer-icon-btn" title="上传 Excel（.xlsx）" aria-label="上传 Excel">
+              <label className="composer-icon-btn" title="上传 Excel（.xlsx）或由其导出的 PDF" aria-label="上传 Excel 或 PDF">
                 <input
                   type="file"
-                  accept=".xlsx,.xls"
+                  accept=".xlsx,.xls,.pdf"
                   hidden
                   disabled={attachBusy || loading}
                   onChange={onPickAttachment}

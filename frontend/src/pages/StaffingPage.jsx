@@ -5,6 +5,8 @@ import {
   getStaffingSummary,
   listMyStaffingProjects,
   listStaffingFacts,
+  mergeStaffingNames,
+  repairStaffingRosterNames,
   reviewStaffingImport,
   uploadStaffingImport,
   voidStaffing,
@@ -14,13 +16,13 @@ import StaffingSummaryPanel from "../components/StaffingSummaryPanel.jsx";
 
 const KIND_LABEL = {
   internal_formal: "正式我司",
-  internal_contract: "我司·外包性质",
+  internal_contract: "机电服务处",
 };
 
 export default function StaffingPage() {
-  const { hasPermission } = useAuth();
-  const canWrite = hasPermission("staffing:write");
-  const canRead = hasPermission("staffing:read");
+  const { user, hasPermission } = useAuth();
+  const canRead = Boolean(user?.can_staffing);
+  const canWrite = canRead && hasPermission("staffing:write");
 
   const [projects, setProjects] = useState([]);
   const [projectId, setProjectId] = useState("");
@@ -29,8 +31,11 @@ export default function StaffingPage() {
   const [facts, setFacts] = useState([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [mergeBusy, setMergeBusy] = useState(false);
+  const [repairBusy, setRepairBusy] = useState(false);
   const [selectedPeople, setSelectedPeople] = useState([]);
   const [collisionChoices, setCollisionChoices] = useState({});
+  const [rosterChoices, setRosterChoices] = useState({});
 
   useEffect(() => {
     if (!canRead) return;
@@ -67,6 +72,8 @@ export default function StaffingPage() {
       if (["project_unmatched", "project_ambiguous"].includes(w.code) && batch.project_id) {
         return false;
       }
+      if (w.code === "roster_name_corrected") return false;
+      if (w.code === "roster_unavailable") return true;
       if (w.code === "name_kind_collision") {
         const name = w.detail?.person_name;
         const entry = resolved.name_kind_collision?.[name] || collisionChoices[name];
@@ -74,9 +81,31 @@ export default function StaffingPage() {
         if (entry?.action === "merge" && entry?.keep_kind) return false;
         return true;
       }
+      if (w.code === "roster_name_unresolved") {
+        const token = w.detail?.token;
+        const entry = resolved.roster_name_unresolved?.[token] || rosterChoices[token];
+        if (entry?.action === "discard") return false;
+        if (
+          (entry?.action === "select_roster_name" || entry?.action === "rename") &&
+          entry?.name
+        ) {
+          return false;
+        }
+        return true;
+      }
       return !resolved[w.code];
     });
-  }, [batch, collisionChoices]);
+  }, [batch, collisionChoices, rosterChoices]);
+
+  const rosterUnresolved = useMemo(() => {
+    if (!batch) return [];
+    return (batch.warnings || []).filter((w) => w.code === "roster_name_unresolved");
+  }, [batch]);
+
+  const rosterUnavailable = useMemo(() => {
+    if (!batch) return false;
+    return (batch.warnings || []).some((w) => w.code === "roster_unavailable");
+  }, [batch]);
 
   function syncCollisionDefaults(b) {
     const init = {};
@@ -86,11 +115,18 @@ export default function StaffingPage() {
       }
     }
     setCollisionChoices(init);
+    setRosterChoices({});
   }
 
   async function onUpload(e) {
     const file = e.target.files?.[0];
     if (!file) return;
+    const lower = (file.name || "").toLowerCase();
+    if (!lower.endsWith(".xlsx") && !lower.endsWith(".pdf")) {
+      setError("仅支持 Excel（.xlsx）或由该工作簿导出的 PDF");
+      e.target.value = "";
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -108,12 +144,21 @@ export default function StaffingPage() {
 
   function buildResolutions(b) {
     const resolutions = {};
+    const skipAck = new Set([
+      "name_kind_collision",
+      "roster_name_unresolved",
+      "roster_unavailable",
+      "roster_name_corrected",
+    ]);
     for (const w of b.warnings || []) {
-      if (!w.code || w.code === "name_kind_collision") continue;
+      if (!w.code || skipAck.has(w.code)) continue;
       resolutions[w.code] = "acknowledged";
     }
     if (Object.keys(collisionChoices).length) {
       resolutions.name_kind_collision = collisionChoices;
+    }
+    if (Object.keys(rosterChoices).length) {
+      resolutions.roster_name_unresolved = rosterChoices;
     }
     return resolutions;
   }
@@ -124,6 +169,25 @@ export default function StaffingPage() {
     setError("");
     try {
       const body = { resolutions: buildResolutions(batch) };
+      if (!batch.project_id && projectId) body.project_id = projectId;
+      const b = await reviewStaffingImport(batch.id, body);
+      setBatch(b);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onMergeNameSplit(shortName, longName) {
+    if (!batch) return;
+    setBusy(true);
+    setError("");
+    try {
+      const body = {
+        resolutions: buildResolutions(batch),
+        person_renames: { [shortName]: longName },
+      };
       if (!batch.project_id && projectId) body.project_id = projectId;
       const b = await reviewStaffingImport(batch.id, body);
       setBatch(b);
@@ -185,7 +249,7 @@ export default function StaffingPage() {
     <main className="panel staffing-page">
       <h1>人员投入</h1>
       <p className="muted">
-        仅统计公司内部员工在场天数（正式我司 / 我司·外包性质）。同名双身份须人工裁定；导入后可导出
+        仅统计公司内部员工在场天数（正式我司 / 机电服务处）。同名双身份须人工裁定；导入后可导出
         Excel。
       </p>
 
@@ -206,10 +270,10 @@ export default function StaffingPage() {
 
         {canWrite ? (
           <label className="file-upload">
-            上传项目日报（.xlsx）
+            上传项目日报（.xlsx 或由其导出的 PDF）
             <input
               type="file"
-              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              accept=".xlsx,.pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/pdf"
               onChange={onUpload}
               disabled={busy}
             />
@@ -277,9 +341,89 @@ export default function StaffingPage() {
                           }
                         >
                           <option value="internal_formal">正式我司</option>
-                          <option value="internal_contract">我司·外包性质</option>
+                          <option value="internal_contract">机电服务处</option>
                         </select>
                       ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+          {rosterUnavailable ? (
+            <div className="tool-card-collisions">
+              <h3>花名册不可用</h3>
+              <p className="muted">
+                请配置人员信息表（环境变量 KB_STAFFING_ROSTER_PATH，默认
+                ./data/staffing_roster.xlsx）后重新导入。无法在缺少花名册时确认入库。
+              </p>
+            </div>
+          ) : null}
+          {rosterUnresolved.length ? (
+            <div className="tool-card-collisions">
+              <h3>花名册无法确认的姓名</h3>
+              {rosterUnresolved.map((w) => {
+                const token = w.detail?.token;
+                const candidates = w.detail?.candidates || [];
+                const choice = rosterChoices[token] || {};
+                return (
+                  <div className="collision-row" key={token}>
+                    <strong>{token}</strong>
+                    <p className="muted">{w.message}</p>
+                    <div className="collision-actions">
+                      {candidates.length ? (
+                        <label>
+                          选定花名册
+                          <select
+                            value={
+                              choice.action === "select_roster_name" ? choice.name || "" : ""
+                            }
+                            onChange={(e) => {
+                              const name = e.target.value;
+                              if (!name) return;
+                              setRosterChoices((prev) => ({
+                                ...prev,
+                                [token]: { action: "select_roster_name", name },
+                              }));
+                            }}
+                          >
+                            <option value="">请选择</option>
+                            {candidates.map((c) => (
+                              <option key={c} value={c}>
+                                {c}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      ) : null}
+                      <label>
+                        改名
+                        <input
+                          type="text"
+                          placeholder="手工姓名"
+                          value={choice.action === "rename" ? choice.name || "" : ""}
+                          onChange={(e) =>
+                            setRosterChoices((prev) => ({
+                              ...prev,
+                              [token]: { action: "rename", name: e.target.value },
+                            }))
+                          }
+                        />
+                      </label>
+                      <label>
+                        <input
+                          type="radio"
+                          name={`roster-discard-${token}`}
+                          checked={choice.action === "discard"}
+                          onChange={() =>
+                            setRosterChoices((prev) => ({
+                              ...prev,
+                              [token]: { action: "discard" },
+                            }))
+                          }
+                        />
+                        丢弃（当日不计）
+                      </label>
                     </div>
                   </div>
                 );
@@ -291,12 +435,33 @@ export default function StaffingPage() {
               <h3>待复核告警（{openWarnings.length}）</h3>
               <ul>
                 {openWarnings
-                  .filter((w) => w.code !== "name_kind_collision")
+                  .filter(
+                    (w) =>
+                      w.code !== "name_kind_collision" &&
+                      w.code !== "roster_name_unresolved" &&
+                      w.code !== "roster_unavailable",
+                  )
                   .slice(0, 30)
                   .map((w, i) => (
                     <li key={`${w.code}-${i}`}>
                       <code>{w.code}</code> {w.message}
                       {w.row ? ` · 行 ${w.row}` : ""}
+                      {w.code === "suspected_name_split" &&
+                      w.detail?.short_name &&
+                      w.detail?.long_name &&
+                      canWrite ? (
+                        <div className="collision-actions">
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              onMergeNameSplit(w.detail.short_name, w.detail.long_name)
+                            }
+                          >
+                            合并为「{w.detail.long_name}」
+                          </button>
+                        </div>
+                      ) : null}
                     </li>
                   ))}
               </ul>
@@ -325,6 +490,45 @@ export default function StaffingPage() {
         <section className="stack-gap">
           <StaffingSummaryPanel
             summary={summary}
+            mergeBusy={mergeBusy}
+            repairBusy={repairBusy}
+            onMergeNames={
+              canWrite && projectId
+                ? async (fromName, toName) => {
+                    setMergeBusy(true);
+                    setError("");
+                    try {
+                      await mergeStaffingNames(projectId, fromName, toName);
+                      await refreshProject(projectId);
+                    } catch (err) {
+                      setError(err.message || "合并失败");
+                    } finally {
+                      setMergeBusy(false);
+                    }
+                  }
+                : undefined
+            }
+            onRepairRosterNames={
+              canWrite && projectId
+                ? async () => {
+                    setRepairBusy(true);
+                    setError("");
+                    try {
+                      const result = await repairStaffingRosterNames(projectId);
+                      await refreshProject(projectId);
+                      if (result.unresolved_count) {
+                        setError(
+                          `已自动纠正 ${result.applied_count} 个姓名；仍有 ${result.unresolved_count} 个需人工裁定`,
+                        );
+                      }
+                    } catch (err) {
+                      setError(err.message || "花名册纠名失败");
+                    } finally {
+                      setRepairBusy(false);
+                    }
+                  }
+                : undefined
+            }
             onExport={
               projectId
                 ? async () => {
@@ -407,6 +611,7 @@ export default function StaffingPage() {
                 <th>日期</th>
                 <th>姓名</th>
                 <th>身份</th>
+                <th>当前阶段</th>
               </tr>
             </thead>
             <tbody>
@@ -415,6 +620,7 @@ export default function StaffingPage() {
                   <td>{f.work_date}</td>
                   <td>{f.person_name}</td>
                   <td>{KIND_LABEL[f.person_kind] || f.person_kind}</td>
+                  <td>{f.stage || "—"}</td>
                 </tr>
               ))}
             </tbody>

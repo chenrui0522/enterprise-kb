@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from datetime import date
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -75,6 +76,7 @@ def _principal(*, perms: tuple[str, ...], project_ids: tuple[str, ...] = ()) -> 
         clearance="general",
         permissions=perms,
         project_ids=project_ids,
+        staffing_org_ok=True,
     )
 
 
@@ -92,6 +94,19 @@ def test_save_chat_xlsx_rejects_non_excel(storage_root) -> None:
     with pytest.raises(AppError) as ei:
         save_chat_xlsx(user_id="u1", filename="notes.txt", data=b"hello")
     assert ei.value.status_code == 400
+    with pytest.raises(AppError) as word:
+        save_chat_xlsx(user_id="u1", filename="日报.docx", data=b"PK\x03\x04word")
+    assert word.value.status_code == 400
+    assert "PDF" in word.value.message
+
+
+def test_save_chat_xlsx_accepts_pdf(storage_root) -> None:
+    meta = save_chat_xlsx(user_id="u1", filename="2515项目日报.pdf", data=b"%PDF-1.4 sample")
+    assert meta["filename"] == "2515项目日报.pdf"
+    stored = Path(meta["storage_key"])
+    if not stored.is_absolute():
+        stored = storage_root / stored
+    assert stored.read_bytes().startswith(b"%PDF")
 
 
 def test_chat_attachments_forbidden_without_chat_perm(storage_root) -> None:

@@ -106,6 +106,10 @@ class StintOut(BaseModel):
 
     days: int
 
+    stages: list[dict[str, Any]] = Field(default_factory=list)
+
+    stage_label: str = ""
+
 
 
 
@@ -121,6 +125,10 @@ class PersonSummaryOut(BaseModel):
     days_on_site: int
 
     dates: list[str] = Field(default_factory=list)
+
+    date_stages: dict[str, str | None] = Field(default_factory=dict)
+
+    stages: list[dict[str, Any]] = Field(default_factory=list)
 
     stint_count: int = 0
 
@@ -150,10 +158,40 @@ class ProjectSummaryOut(BaseModel):
 
     by_kind: ByKindOut = Field(default_factory=ByKindOut)
 
+    name_split_suspects: list[dict[str, Any]] = Field(default_factory=list)
+    roster_name_suspects: list[dict[str, Any]] = Field(default_factory=list)
     label: str = "在场天数"
 
 
+class MergeNamesIn(BaseModel):
 
+    from_name: str
+
+    to_name: str
+
+
+class MergeNamesOut(BaseModel):
+
+    from_name: str
+
+    to_name: str
+
+    renamed: int
+
+    voided_duplicates: int = 0
+
+
+class RepairRosterNamesOut(BaseModel):
+
+    project_id: str
+
+    applied: list[dict[str, Any]] = Field(default_factory=list)
+
+    unresolved: list[dict[str, Any]] = Field(default_factory=list)
+
+    applied_count: int = 0
+
+    unresolved_count: int = 0
 
 
 class FactOut(BaseModel):

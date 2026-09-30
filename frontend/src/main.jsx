@@ -8,6 +8,7 @@ import ChatPage from "./pages/ChatPage.jsx";
 import DocumentsPage from "./pages/DocumentsPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import StaffingPage from "./pages/StaffingPage.jsx";
+import LeaveLedgerPage from "./pages/LeaveLedgerPage.jsx";
 import "./styles.css";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
@@ -20,6 +21,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
             <Route index element={<ChatPage />} />
             <Route path="documents" element={<DocumentsPage />} />
             <Route path="staffing" element={<StaffingPage />} />
+            <Route path="leave-ledger" element={<LeaveLedgerPage />} />
             <Route path="admin" element={<AdminPage />} />
           </Route>
         </Routes>

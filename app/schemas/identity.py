@@ -23,6 +23,8 @@ class PrincipalOut(BaseModel):
     permissions: list[str]
     position_ids: list[str]
     establishment_org_unit_ids: list[str]
+    can_staffing: bool = False
+    can_leave_ledger: bool = False
 
 
 class OrgUnitCreate(BaseModel):

@@ -10,15 +10,17 @@ from app.core.config import get_settings
 from app.core.db import get_db_session
 from app.core.errors import AppError
 from app.core.logging import get_logger
-from app.identity.constants import PERM_STAFFING_READ, PERM_STAFFING_WRITE
-from app.identity.deps import require_permission, tenant_from_principal
+from app.identity.deps import require_staffing, tenant_from_principal
 from app.identity.principal import Principal
 from app.ingestion.storage import FileDocumentStorage
 from app.models.identity import Project
 from app.models.entity import new_id
 from app.schemas.staffing import (
     FactOut,
+    MergeNamesIn,
+    MergeNamesOut,
     ProjectSummaryOut,
+    RepairRosterNamesOut,
     ReviewIn,
     StaffingBatchOut,
     VoidIn,
@@ -36,7 +38,7 @@ MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 @router.get("/staffing/my-projects", response_model=list[dict])
 async def my_staffing_projects(
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_READ)),
+    principal: Principal = Depends(require_staffing(write=False)),
 ) -> list[dict]:
     """Projects the current user may import staffing into."""
     if not principal.project_ids and "projects:manage" not in principal.permissions:
@@ -52,7 +54,7 @@ async def my_staffing_projects(
 async def upload_staffing_import(
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_WRITE)),
+    principal: Principal = Depends(require_staffing(write=True)),
     tenant_id: str = Depends(tenant_from_principal),
 ) -> StaffingBatchOut:
     _ = tenant_id
@@ -78,7 +80,7 @@ async def upload_staffing_import(
 async def get_staffing_import(
     batch_id: str,
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_READ)),
+    principal: Principal = Depends(require_staffing(write=False)),
     tenant_id: str = Depends(tenant_from_principal),
 ) -> StaffingBatchOut:
     batch = await staffing_service.get_batch(session, tenant_id, batch_id)
@@ -92,7 +94,7 @@ async def review_staffing_import(
     batch_id: str,
     body: ReviewIn,
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_WRITE)),
+    principal: Principal = Depends(require_staffing(write=True)),
 ) -> StaffingBatchOut:
     batch = await staffing_service.review_batch(
         session,
@@ -109,7 +111,7 @@ async def review_staffing_import(
 async def confirm_staffing_import(
     batch_id: str,
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_WRITE)),
+    principal: Principal = Depends(require_staffing(write=True)),
 ) -> StaffingBatchOut:
     batch = await staffing_service.confirm_batch(
         session, principal=principal, batch_id=batch_id
@@ -123,7 +125,7 @@ async def confirm_staffing_import(
 async def staffing_summary(
     project_id: str,
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_READ)),
+    principal: Principal = Depends(require_staffing(write=False)),
 ) -> ProjectSummaryOut:
     data = await staffing_service.project_summary(
         session, principal=principal, project_id=project_id
@@ -131,20 +133,66 @@ async def staffing_summary(
     return ProjectSummaryOut.model_validate(data)
 
 
+@router.post(
+    "/staffing/projects/{project_id}/merge-names",
+    response_model=MergeNamesOut,
+)
+async def staffing_merge_names(
+    project_id: str,
+    body: MergeNamesIn,
+    session: AsyncSession = Depends(get_db_session),
+    principal: Principal = Depends(require_staffing(write=True)),
+) -> MergeNamesOut:
+    result = await staffing_service.merge_person_names(
+        session,
+        principal=principal,
+        project_id=project_id,
+        from_name=body.from_name,
+        to_name=body.to_name,
+    )
+    return MergeNamesOut.model_validate(result)
+
+
+@router.post(
+    "/staffing/projects/{project_id}/repair-roster-names",
+    response_model=RepairRosterNamesOut,
+)
+async def staffing_repair_roster_names(
+    project_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    principal: Principal = Depends(require_staffing(write=True)),
+) -> RepairRosterNamesOut:
+    """Auto-correct active attendance names uniquely matched to the roster."""
+    result = await staffing_service.repair_project_names_from_roster(
+        session, principal=principal, project_id=project_id
+    )
+    return RepairRosterNamesOut.model_validate(result)
+
+
 @router.get("/staffing/projects/{project_id}/export.xlsx")
 async def staffing_export_xlsx(
     project_id: str,
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_READ)),
+    principal: Principal = Depends(require_staffing(write=False)),
 ) -> Response:
     data = await staffing_service.export_project_xlsx(
         session, principal=principal, project_id=project_id
     )
-    filename = f"staffing-{project_id}.xlsx"
+    from urllib.parse import quote
+
+    from app.models.identity import Project
+
+    proj = await session.get(Project, project_id)
+    code = (proj.code if proj else None) or project_id
+    filename = f"人员投入汇总表-{code}.xlsx"
+    disposition = (
+        f"attachment; filename=\"staffing-{code}.xlsx\"; "
+        f"filename*=UTF-8''{quote(filename)}"
+    )
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": disposition},
     )
 
 
@@ -153,7 +201,7 @@ async def staffing_facts(
     project_id: str,
     include_voided: bool = Query(False),
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_READ)),
+    principal: Principal = Depends(require_staffing(write=False)),
 ) -> list[FactOut]:
     facts = await staffing_service.list_facts(
         session,
@@ -169,7 +217,7 @@ async def staffing_void(
     project_id: str,
     body: VoidIn,
     session: AsyncSession = Depends(get_db_session),
-    principal: Principal = Depends(require_permission(PERM_STAFFING_WRITE)),
+    principal: Principal = Depends(require_staffing(write=True)),
 ) -> VoidOut:
     count = await staffing_service.void_facts(
         session,

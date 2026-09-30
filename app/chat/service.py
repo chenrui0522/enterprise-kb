@@ -101,6 +101,21 @@ async def get_conversation(
     return conversation
 
 
+async def delete_conversation(
+    session: AsyncSession,
+    tenant_id: str,
+    conversation_id: str,
+    *,
+    created_by: str | None = None,
+) -> None:
+    """Hard-delete a conversation owned by the user (messages cascade in DB)."""
+    conversation = await get_conversation(
+        session, tenant_id, conversation_id, created_by=created_by
+    )
+    await session.delete(conversation)
+    await session.commit()
+
+
 async def list_messages(
     session: AsyncSession, tenant_id: str, conversation_id: str, *, created_by: str | None = None
 ) -> list[tuple[Message, list[MessageCitation]]]:

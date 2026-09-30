@@ -35,6 +35,49 @@ def build_stints(dates: list[str]) -> list[dict[str, Any]]:
     return stints
 
 
+def stage_day_counts(date_stages: dict[str, str | None]) -> list[dict[str, Any]]:
+    """Aggregate ``{date: stage}`` into ``[{stage, days}, ...]`` (blank stage omitted)."""
+    counts: dict[str, int] = {}
+    for stage in date_stages.values():
+        label = (stage or "").strip()
+        if not label:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+    return [
+        {"stage": name, "days": counts[name]}
+        for name in sorted(counts.keys())
+    ]
+
+
+def annotate_stints_with_stages(
+    stints: list[dict[str, Any]],
+    date_stages: dict[str, str | None],
+) -> list[dict[str, Any]]:
+    """Attach per-stint stage day counts from calendar ``date_stages``."""
+    if not stints:
+        return []
+    annotated: list[dict[str, Any]] = []
+    for stint in stints:
+        entry = date.fromisoformat(stint["entry_date"])
+        exit_ = date.fromisoformat(stint["exit_date"])
+        scoped: dict[str, str | None] = {}
+        cursor = entry
+        while cursor <= exit_:
+            iso = cursor.isoformat()
+            if iso in date_stages:
+                scoped[iso] = date_stages.get(iso)
+            cursor += timedelta(days=1)
+        stages = stage_day_counts(scoped)
+        item = dict(stint)
+        item["stages"] = stages
+        item["stage_label"] = "、".join(
+            f"{row['stage']}({row['days']}天)" if row["days"] != stint.get("days") else row["stage"]
+            for row in stages
+        )
+        annotated.append(item)
+    return annotated
+
+
 def _stint(index: int, start: date, end: date) -> dict[str, Any]:
     return {
         "index": index,

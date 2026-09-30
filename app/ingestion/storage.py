@@ -31,6 +31,15 @@ class FileDocumentStorage:
         target.write_bytes(data)
         return str(target.relative_to(self._root))
 
+    def store_leave_ledger(self, job_id: str, role: str, filename: str, data: bytes) -> str:
+        """Persist an original leave-ledger source workbook for a job/role."""
+        safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", os.path.basename(filename))
+        directory = self._root / "leave_ledger" / job_id / role
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / safe_name
+        target.write_bytes(data)
+        return str(target.relative_to(self._root))
+
     def store_chat_attachment(self, attachment_id: str, filename: str, data: bytes) -> str:
         """Persist a chat composer attachment; returns relative storage key."""
         safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", os.path.basename(filename))

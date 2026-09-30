@@ -97,6 +97,16 @@ class Settings(BaseSettings):
     queue_key: str = "kb:ingestion:jobs"
     queue_processing_key: str = "kb:ingestion:processing"
 
+    # Staffing export: optional 人员信息表 (姓名/部门/工种) for 部门·职务 columns
+    staffing_roster_path: str = "./data/staffing_roster.xlsx"
+
+    # Leave ledger: HQ punch address keywords (comma-separated) and holiday calendar path
+    leave_ledger_hq_address_keywords: str = "太原,奥特莱,Autley,公司"
+    leave_ledger_holidays_path: str = "./data/leave_ledger_holidays_2026.txt"
+    leave_ledger_half_day_hours_threshold: float = 4.0
+    leave_ledger_full_day_hours_threshold: float = 8.0
+    leave_ledger_travel_merge_gap_days: int = 1
+
     # MinerU OCR service (optional). When mineru_url is set, image uploads and
     # scanned PDFs are parsed by a remote mineru-api service; complex layout
     # manuals can force OCR at upload time via parse_mode="ocr".

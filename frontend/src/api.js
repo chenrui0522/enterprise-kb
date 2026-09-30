@@ -59,6 +59,12 @@ export async function updateConversationTitle(conversationId, title) {
   });
 }
 
+export async function deleteConversation(conversationId) {
+  return jsonFetch(`/conversations/${conversationId}`, {
+    method: "DELETE",
+  });
+}
+
 export async function getMessages(conversationId) {
   return jsonFetch(`/conversations/${conversationId}/messages`);
 }
@@ -356,6 +362,20 @@ export async function getStaffingSummary(projectId) {
   return jsonFetch(`/staffing/projects/${projectId}/summary`);
 }
 
+export async function mergeStaffingNames(projectId, fromName, toName) {
+  return jsonFetch(`/staffing/projects/${projectId}/merge-names`, {
+    method: "POST",
+    body: JSON.stringify({ from_name: fromName, to_name: toName }),
+  });
+}
+
+export async function repairStaffingRosterNames(projectId) {
+  return jsonFetch(`/staffing/projects/${projectId}/repair-roster-names`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
 export async function exportStaffingXlsx(projectId) {
   const response = await fetch(`${API_BASE}/staffing/projects/${projectId}/export.xlsx`, {
     method: "GET",
@@ -394,3 +414,104 @@ export async function voidStaffing(projectId, body) {
     body: JSON.stringify(body),
   });
 }
+
+// ---- Leave ledger ----
+
+export async function createLeaveLedgerJob(files) {
+  const form = new FormData();
+  for (const file of files) {
+    form.append("files", file);
+  }
+  const response = await fetch(`${API_BASE}/leave-ledger/jobs`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+export async function getLeaveLedgerJob(jobId) {
+  return jsonFetch(`/leave-ledger/jobs/${jobId}`);
+}
+
+export async function listConfirmedLeaveLedgerJobs() {
+  return jsonFetch(`/leave-ledger/jobs?status=confirmed`);
+}
+
+export async function mergeLeaveLedgerJob(jobId, priorJobId) {
+  return jsonFetch(`/leave-ledger/jobs/${jobId}/merge`, {
+    method: "POST",
+    body: JSON.stringify({ prior_job_id: priorJobId }),
+  });
+}
+
+export async function uploadLeaveLedgerSource(jobId, file) {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${API_BASE}/leave-ledger/jobs/${jobId}/sources`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+export async function reviewLeaveLedgerJob(jobId, resolutions) {
+  return jsonFetch(`/leave-ledger/jobs/${jobId}/review`, {
+    method: "POST",
+    body: JSON.stringify({ resolutions }),
+  });
+}
+
+export async function confirmLeaveLedgerJob(jobId) {
+  return jsonFetch(`/leave-ledger/jobs/${jobId}/confirm`, { method: "POST", body: "{}" });
+}
+
+export async function voidLeaveLedgerJob(jobId, reason = "") {
+  return jsonFetch(`/leave-ledger/jobs/${jobId}/void`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+export async function exportLeaveLedgerXlsx(jobId) {
+  const response = await fetch(`${API_BASE}/leave-ledger/jobs/${jobId}/export.xlsx`, {
+    method: "GET",
+    credentials: "include",
+  });
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return response.blob();
+}
+

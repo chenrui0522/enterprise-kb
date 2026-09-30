@@ -274,7 +274,7 @@ uv run python -m app.reindex --wait --timeout 3600            # 全量重导（�
 - **原文**：`compressed=true` 后仍可在消息历史查询；PostgreSQL 为唯一事实来源，清空 Redis 不影响恢复。
 - **前端**：URL `?c=` + `localStorage` 持久化会话；侧栏只读「会话记忆（压缩摘要）」。
 - **自观测**：L1 事件 `memory.budget_check` / `compress_enqueued` / `compress_done` / `compress_failed`；L2 见 `tests/test_conversation_memory.py`。预算默认值可按观测人调 env，不自动改参。
-- `POST /api/v1/conversations`、`GET /api/v1/conversations`、`PATCH /api/v1/conversations/{id}`（改标题）、`GET /api/v1/conversations/{id}/messages`
+- `POST /api/v1/conversations`、`GET /api/v1/conversations`、`PATCH /api/v1/conversations/{id}`（改标题）、`DELETE /api/v1/conversations/{id}`（硬删除本人会话，消息/摘要级联删除）、`GET /api/v1/conversations/{id}/messages`
 - `POST /api/v1/feedback`：答案反馈占位
 - `GET /api/v1/audit/events`（需 `audit:read`；支持 `action` / `actor` / `since` / `until` / `offset` / `limit`）、`GET /healthz`
 
@@ -308,7 +308,7 @@ uv run python -m app.reindex --wait --timeout 3600            # 全量重导（�
 
 ### 审计查阅
 
-管理端「审计」页签（需 `audit:read`，如 auditor 角色）可按动作、操作者筛选本租户事件。关键写操作（登录、组织/岗位/绑岗/密级/项目成员、文档上传与重试、问答完成）会写入 `audit_events`。
+管理端「审计」页签（需 `audit:read`，如 auditor 角色）可按动作、操作者、时间范围（今天 / 近 7 天 / 近 30 天 / 全部 / 自定义起止）筛选本租户事件，并支持分页翻看更早记录。关键写操作（登录、组织/岗位/绑岗/密级/项目成员、文档上传与重试、问答完成、人员投入相关写操作、调休台账上传/复核/确认/作废）会写入 `audit_events`。
 
 SSE 事件：`message_start` → `token`* → (`error`) → `done`。`done` 携带完整答案与 `citations`（文档名 + 页码）。
 
@@ -336,7 +336,8 @@ scripts/       init-models.sh 等
 - **父子分块 / 表格两级处理**：`app/ingestion/parent_child.py`（父块打包、子块策略、表格行级与摘要），生成端展开在 `app/chat/parent_context.py`，元数据过滤表达式在 `app/retrieval/milvus_store.py:build_filter_expr`。
 - **换向量库 / 检索策略**：`app/retrieval/milvus_store.py` 是唯一直接触碰 Milvus 的地方。
 - **多租户 / 权限 / 审计 / 反馈**：全集团单一 `tenant_id`（默认 `autley`）；太原/朔州/苏州是人身上的地点（通讯录☆太原/朔州/苏州公司仅标签，不进 `org_units`）。身份模型为组织树 + 一人多岗（`user_positions`）+ 角色权限串 + 编制 + 密级 + 项目授权。组织树与企业微信通讯录文件夹一致：公司根下为总经理办 + 八中心 + 泰国公司（公司直属部门）及下属部/组；软件部/采购部挂在产品中心。岗位视野仍为本级（挂在组上不自动看上级部）。登录后每请求现算 Principal，文档列表与 Milvus 召回共用可见性公式（部门/编制本级过密级，或项目∩专业不过密级）。API 启动时会把代码里的 `ROLE_PERMISSIONS` 幂等同步进库（避免新增权限如 `staffing:*` 后旧库角色缺权）。规划见 `openspec/changes/archive/2026-09-20-add-org-tree-and-access-control/`；通讯录全量种子见 `openspec/changes/sync-org-units-from-address-book/`。引导：`uv run python -m app.cli create-admin --username ... --password ... --clearance general --org-code gm_office`；演示种子：`uv run python -m app.cli seed-demo`。
-- **人员投入（项目日报）**：上传标准 `.xlsx` 项目日报 → 解析内部员工（C 列【公司人员】+ 右侧「我司人员」姓名格；忽略外部【外包人员】）→ 脏数据人工复核（含**同名双身份**须裁定分列或合并）→ 确认后按项目按「姓名+身份」汇总有谁/在场天数，含区间、人天、身份小计、轻量图与 xlsx 导出。**工期段**由连续在场日历日自动派生（相邻日同属一段，断 ≥1 日则新开段；汇总/对话卡/导出展示进场次数与各段入出）。权限：`staffing:read` / `staffing:write`。前端导航「人员投入」保留；也可在问答工具下拉或附日报完成同一流程。变更见 `openspec/changes/add-staffing-daily-import/`、`add-chat-staffing-tool/`、`enrich-staffing-summary/`、`add-staffing-work-stints/`。- **LangSmith / trace**：模型 provider 与图节点中已留出埋点位；本期使用结构化日志，无需改接口即可后续接入。
+- **人员投入（项目日报）**：上传标准 `.xlsx` 或由其导出的 PDF 项目日报 → 解析内部员工（C 列【公司人员】+ 右侧「我司人员」姓名格；忽略外部【外包人员】）→ **按人员信息花名册纠名**（`KB_STAFFING_ROSTER_PATH`，默认 `./data/staffing_roster.xlsx`；唯一前缀/后缀自动纠正，无法确认或花名册缺失则待复核）→ 脏数据人工复核（含同名双身份、花名册未决姓名）→ 确认后按项目汇总；导出为「人员投入汇总表」人×日结构（部门/职务来自花名册）。权限：`staffing:read` / `staffing:write`，**且**岗位/编制须落在 `project_mgmt`（项目管理部）组织子树（含项目一/二部）；持有 `users:manage` 的管理员绕过组织闸。`/auth/me` 返回 `can_staffing`。
+- **调休台账**：一次上传出差 / 法定假日加班 / 请假 / 打卡四类企微导出 → 按太原调休台账规则计算可调休与已调休 → 告警人工复核（加班缺打卡/半天冲突可决议排除=0、按半日记=0.5、按满日记=1，决议写回额度）→ 确认后导出**一人多行**太原模板形 xlsx（双行表头；出差段/加班日/调休假段分列；人级合计列合并；额度为 0 的加班日不占行；相对早期一人一行导出版式为 BREAKING）。项目出差段内加班仅计**法定假日本体日**（如端午当天），不含放假调休连休日。权限：`leave_ledger:read` / `leave_ledger:write`（admin/editor 默认可写，reader 只读），**且**岗位/编制须落在 `ops`（运营管理中心）组织子树；持有 `users:manage` 的管理员绕过组织闸。`/auth/me` 返回 `can_leave_ledger`。配置：`KB_LEAVE_LEDGER_HQ_ADDRESS_KEYWORDS`（回司地址关键词，默认含「太原,奥特莱,公司」）、`KB_LEAVE_LEDGER_HOLIDAYS_PATH`（默认 `./data/leave_ledger_holidays_2026.txt`，只列可计加班调休的法定假日本体，不是整段连休）。前端路由：`/leave-ledger`；问答页工具下拉亦可选「调休台账」在对话内分次补齐四源并确认导出。可将**用户显式选择的已确认 prior job**与本月未确认结果做段级合并（出差并集重算 30 天块；加班/调休同键以上月优先），写回本月后再确认导出。规划见 `openspec/changes/align-leave-ledger-ot-resolve-and-export/`、`merge-leave-ledger-jobs`。
 
 ## 测试
 

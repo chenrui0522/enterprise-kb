@@ -22,7 +22,7 @@ export default function StaffingChart({ summary }) {
           <span className="staffing-bar-value">{formalDays}</span>
         </div>
         <div className="staffing-bar-row">
-          <span className="staffing-bar-label">外包性质</span>
+          <span className="staffing-bar-label">机电服务处</span>
           <div className="staffing-bar-track">
             <div
               className="staffing-bar-fill contract"

@@ -77,6 +77,34 @@ def test_extract_codes_from_filename() -> None:
     assert "2515" in extract_project_codes("2515项目日报260721.xlsx")
 
 
+def test_suspected_name_split_warns_for_prefix_fragment() -> None:
+    from app.staffing.parse import _suspected_name_split_pairs, parse_daily_report
+
+    assert ("豆子", "豆子度") in _suspected_name_split_pairs(["豆子度", "豆子", "王亮"])
+    assert _suspected_name_split_pairs(["张三", "李四"]) == []
+
+    wb = Workbook()
+    ws = wb.active
+    ws["B4"] = "日期"
+    ws["C4"] = "现场施工人员/人数"
+    ws["K6"] = "我司人员\n姓名"
+    ws["B8"] = date(2026, 8, 17)
+    ws["C8"] = "【公司人员】：1人，豆子 【外包人员】："
+    ws["K8"] = ""
+    ws["B9"] = date(2026, 8, 18)
+    ws["C9"] = "【公司人员】：1人，豆子度 【外包人员】："
+    ws["K9"] = ""
+    buf = io.BytesIO()
+    wb.save(buf)
+    result = parse_daily_report(buf.getvalue(), filename="2515项目日报.xlsx")
+    assert any(
+        w.code == "suspected_name_split"
+        and (w.detail or {}).get("short_name") == "豆子"
+        and (w.detail or {}).get("long_name") == "豆子度"
+        for w in result.warnings
+    )
+
+
 def test_parse_internal_only_and_kinds() -> None:
     data = _build_sample_xlsx()
     result = parse_daily_report(data, filename="2515项目日报.xlsx")
@@ -91,6 +119,7 @@ def test_parse_internal_only_and_kinds() -> None:
     jan = [r for r in result.rows if r.work_date == "2026-01-11"]
     assert {r.person_name for r in jan} == {"赵鑫磊", "王亮", "高建", "张梦翔"}
     assert all(r.person_kind == KIND_CONTRACT for r in jan)
+    assert all(r.stage == "机械安装" for r in jan)
 
     # Mar 9: 王亮 appears as both formal (C) and contract (K) → two rows that day
     mar_wang = [
@@ -99,6 +128,7 @@ def test_parse_internal_only_and_kinds() -> None:
         if r.work_date == "2026-03-09" and r.person_name == "王亮"
     ]
     assert set(mar_wang) == {KIND_FORMAL, KIND_CONTRACT}
+    assert all(r.stage == "电气安装" for r in result.rows if r.work_date == "2026-03-09")
     mar_contract = {
         r.person_name
         for r in result.rows
@@ -114,6 +144,7 @@ def test_parse_internal_only_and_kinds() -> None:
     }
     assert ("冯江伟", KIND_FORMAL) in apr
     assert ("马越", KIND_FORMAL) in apr
+    assert all(r.stage == "软件调试" for r in result.rows if r.work_date == "2026-04-11")
 
     # Ambiguous 王磊工 still counted + warned
     assert any(r.person_name == "王磊工" for r in result.rows)

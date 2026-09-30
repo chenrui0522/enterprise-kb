@@ -75,7 +75,8 @@ export default function App() {
     hasPermission("projects:manage");
   const canAudit = hasPermission("audit:read");
   const canDocs = hasPermission("documents:write") || hasPermission("documents:read");
-  const canStaffing = hasPermission("staffing:read") || hasPermission("staffing:write");
+  const canStaffing = Boolean(user?.can_staffing);
+  const canLeaveLedger = Boolean(user?.can_leave_ledger);
 
   return (
     <div className="app-shell">
@@ -108,6 +109,15 @@ export default function App() {
             >
               <DocsNavIcon />
               人员投入
+            </NavLink>
+          ) : null}
+          {canLeaveLedger ? (
+            <NavLink
+              to="/leave-ledger"
+              className={({ isActive }) => `app-nav-item${isActive ? " active" : ""}`}
+            >
+              <DocsNavIcon />
+              调休台账
             </NavLink>
           ) : null}
           {canManage ? (

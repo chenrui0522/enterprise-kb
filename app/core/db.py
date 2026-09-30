@@ -58,6 +58,7 @@ async def create_tables_if_needed() -> None:
     import app.models.entity  # noqa: F401
     import app.models.identity  # noqa: F401
     import app.models.staffing  # noqa: F401
+    import app.models.leave_ledger  # noqa: F401
 
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
