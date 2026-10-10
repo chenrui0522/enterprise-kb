@@ -16,16 +16,18 @@
 
 5. 主规格已写入「审批断档后外勤打卡仍计出差」段落（`openspec/specs/attendance-summary-ledger/spec.md`）。
 
+## 本地 Git（已 commit，未 push）
+
+- Commit: `facd846` — `feat: restore attendance summary ledger and align travel rules`
+- Branch: `main` **ahead 1** of `origin/main`
+- 未执行 `git push`（等你确认）
+
 ## 等你明天确认
 
-1. **归档** `align-attendance-to-correct-ledger`  
-   - OpenSpec archive 流程会问是否 sync delta → main（主规格里部分 delta 条款可能尚未完整合并，除今晚已写入的续差条外）。  
-   - 请回复：`同步并归档` / `只归档不额外 sync` / `先别动`。
-
-2. **Git push**  
-   - 若夜间已本地 commit，是否 `git push origin main`？  
-   - 请回复：`推送` / `先看 commit 再推`。
+1. **Git push**：回复 `推送` → 执行 `git push origin main`
+2. **归档** `align-attendance-to-correct-ledger`：回复 `同步并归档` / `只归档不 sync` / `先别动`  
+   （续差条款已写入主规格；变更目录里其它 delta 仍可能需 sync）
 
 ## 建议明天第一句
 
-「确认：同步并归档 align-attendance，并 push」或按需改口令。
+「推送，并同步归档 align-attendance」
