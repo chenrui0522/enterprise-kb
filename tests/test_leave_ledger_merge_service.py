@@ -235,3 +235,72 @@ async def test_review_after_merge_keeps_merged_rows(tmp_path, monkeypatch) -> No
         assert dates.get("2026-01-05") == 0.5
         assert dates.get("2026-02-01") == 1.0
         assert job.compute_result.get("merged_from_job_id") == "job-prior"
+
+
+@pytest.mark.asyncio
+async def test_import_prior_from_export_and_merge(tmp_path) -> None:
+    from app.leave_ledger.export import build_ledger_xlsx
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm4.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    export_bytes = build_ledger_xlsx(
+        [
+            {
+                "person_name": "甲",
+                "center": "",
+                "department": "",
+                "travel_segments": [],
+                "ot_days": [{"date": "2026-01-05", "credit": 0.5}],
+                "leave_segments": [],
+                "total_comp_days": 0.5,
+                "used_comp_days": 0.0,
+                "remaining_comp_days": 0.5,
+                "remark": "",
+            }
+        ]
+    )
+    async with factory() as session:
+        prior = await leave_service.import_prior_from_export(
+            session,
+            principal=_principal(),
+            filename="上月台账.xlsx",
+            data=export_bytes,
+        )
+        assert prior.status == "confirmed"
+        assert leave_service.prior_source_of_job(prior) == "export_import"
+        listed = await leave_service.list_confirmed_jobs(session, tenant_id="autley")
+        assert any(j.id == prior.id for j in listed)
+
+        current = LeaveLedgerJob(
+            id="job-cur",
+            tenant_id="autley",
+            status="parsed",
+            created_by="u1",
+            compute_result={
+                "rows": [
+                    {
+                        "person_name": "甲",
+                        "ot_days": [{"date": "2026-02-01", "credit": 1.0}],
+                        "travel_segments": [],
+                        "leave_segments": [],
+                    }
+                ]
+            },
+            warnings=[],
+            resolved_warnings={},
+        )
+        session.add(current)
+        await session.commit()
+
+        job = await leave_service.merge_job(
+            session,
+            principal=_principal(),
+            job_id="job-cur",
+            prior_job_id=prior.id,
+        )
+        dates = {d["date"]: d["credit"] for d in job.compute_result["rows"][0]["ot_days"]}
+        assert dates["2026-01-05"] == 0.5
+        assert dates["2026-02-01"] == 1.0
+        assert job.compute_result.get("merged_from_job_id") == prior.id

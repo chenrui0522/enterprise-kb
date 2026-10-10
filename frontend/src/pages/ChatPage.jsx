@@ -5,6 +5,8 @@ import {
   chatToolAction,
   createConversation,
   deleteConversation,
+  exportAttendanceSummaryXlsx,
+  previewAttendanceSummaryXlsx,
   exportLeaveLedgerXlsx,
   exportStaffingXlsx,
   getConversationMemory,
@@ -447,11 +449,568 @@ function mergeLeaveResolutions(base, local) {
   return out;
 }
 
+const QUALITY_PAGE_SIZE_DEFAULT = 50;
+
+function AttendanceSummaryJobCard({ card, disabled, onAction }) {
+  const [error, setError] = useState("");
+  const [exportBusy, setExportBusy] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [priorJobId, setPriorJobId] = useState("");
+  const [qualityPage, setQualityPage] = useState(0);
+
+  const roles = card.roles || [];
+  const needRolePick = Boolean(card.need_role_pick);
+  const openWarnings = useMemo(
+    () =>
+      (card.warnings || []).filter((w) => {
+        const id = w.id || "";
+        const resolved = card.resolved_warnings || {};
+        return w.blocking !== false && id && !(id in resolved);
+      }),
+    [card.warnings, card.resolved_warnings]
+  );
+  const qualityWarnings = useMemo(() => {
+    if (Array.isArray(card.quality_samples) && card.quality_samples.length) {
+      return card.quality_samples;
+    }
+    return (card.warnings || []).filter((w) => {
+      if (w.type !== "data_quality") return false;
+      const id = w.id || "";
+      const entry = (card.resolved_warnings || {})[id];
+      return !(entry && entry.action === "ack");
+    });
+  }, [card.warnings, card.resolved_warnings, card.quality_samples]);
+  const pendingCount =
+    typeof card.open_blocking_count === "number"
+      ? card.open_blocking_count
+      : openWarnings.length;
+  const qualityUnackedCount =
+    typeof card.quality_unacked_count === "number"
+      ? card.quality_unacked_count
+      : qualityWarnings.length;
+  const qualitySummary = card.quality_summary || null;
+  const qualityPageSize =
+    Number(card.quality_page_size) > 0
+      ? Number(card.quality_page_size)
+      : QUALITY_PAGE_SIZE_DEFAULT;
+  const qualityPageCount = Math.max(1, Math.ceil(qualityWarnings.length / qualityPageSize) || 1);
+  const qualityPageSafe = Math.min(qualityPage, qualityPageCount - 1);
+  const qualityPageItems = qualityWarnings.slice(
+    qualityPageSafe * qualityPageSize,
+    qualityPageSafe * qualityPageSize + qualityPageSize
+  );
+  const hasAckAction = (card.actions || []).some(
+    (a) => a.id === "attendance_summary.ack_data_quality"
+  );
+
+  useEffect(() => {
+    setQualityPage(0);
+  }, [card.job_id, card.quality_unacked_count, qualityWarnings.length]);
+  const periodConfirmed = Boolean(card.period_confirmed);
+  const calendarConfirmed = Boolean(card.calendar_confirmed);
+  const canConfirm =
+    !needRolePick &&
+    Boolean(card.has_roster) &&
+    (card.row_count || 0) > 0 &&
+    card.status === "computed" &&
+    pendingCount === 0 &&
+    qualityUnackedCount === 0 &&
+    periodConfirmed &&
+    calendarConfirmed;
+
+  const run = async (action, payload = {}) => {
+    setError("");
+    setBusy(true);
+    try {
+      await onAction(action, { job_id: card.job_id, ...payload });
+    } catch (err) {
+      setError(err.message || "操作失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onExport = async () => {
+    setExportBusy(true);
+    setError("");
+    try {
+      await run("attendance_summary.export", {});
+      const blob = await exportAttendanceSummaryXlsx(card.job_id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `考勤汇总-${card.year || ""}-${card.month || ""}-${card.job_id}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err.message || "导出失败");
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const onPreviewExport = async () => {
+    setExportBusy(true);
+    setError("");
+    try {
+      await run("attendance_summary.preview_export", {});
+      const blob = await previewAttendanceSummaryXlsx(card.job_id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `考勤汇总预览-${card.year || ""}-${card.month || ""}-${card.job_id}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err.message || "预览导出失败");
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const onAckQualityAll = async () => {
+    if (
+      !window.confirm(
+        `确认已知悉全部 ${qualityUnackedCount || ""} 条数据质量告警？知悉不会自动改日格数字。`
+      )
+    ) {
+      return;
+    }
+    await run("attendance_summary.ack_data_quality", { ack_all: true });
+  };
+
+  const onAckQualityOne = async (warningId) => {
+    if (!warningId) return;
+    await run("attendance_summary.ack_data_quality", {
+      ack_all: false,
+      warning_ids: [warningId],
+    });
+  };
+
+  const onConfirm = async () => {
+    if (!window.confirm("确认将该考勤汇总台账标记为已确认？确认后可导出正式台账。")) return;
+    await run("attendance_summary.confirm", { confirmed: true });
+  };
+
+  const onVoid = async () => {
+    if (!window.confirm("确认作废该考勤汇总任务？此操作不可撤销。")) return;
+    await run("attendance_summary.void", { confirmed: true, reason: "对话中作废" });
+  };
+
+  const actionsDisabled = disabled || busy || exportBusy;
+  const priorOptions = card.prior_options || [];
+  const workingNonWork =
+    card.working_non_work_dates || card.non_work_dates || card.draft_non_work_dates || [];
+
+  return (
+    <div className="tool-card">
+      <div className="tool-card-title">考勤汇总台账 · 任务进度</div>
+      <p className="muted">
+        {card.job_id?.slice(0, 8)}… · {card.year}-{String(card.month || 0).padStart(2, "0")} ·{" "}
+        {card.status}
+        {pendingCount ? ` · 待决议 ${pendingCount}` : ""}
+        {qualityUnackedCount ? ` · 质量待知悉 ${qualityUnackedCount}` : ""}
+        {card.row_count != null ? ` · ${card.row_count} 人` : ""}
+        {card.has_roster ? ` · 花名册 ${card.roster_count || 0}` : " · 无花名册"}
+      </p>
+      <p className="muted tool-card-hint">
+        账期：{periodConfirmed ? "已确认" : "未确认"}
+        {card.month_incomplete && !periodConfirmed ? "（月尚未结束）" : ""}
+        {" · "}
+        非出勤日：{calendarConfirmed ? `已确认 ${(card.non_work_dates || []).length} 天` : "未确认"}
+        {!calendarConfirmed && workingNonWork.length
+          ? `（工作副本 ${workingNonWork.length} 天）`
+          : ""}
+      </p>
+      {card.note ? <p className="muted tool-card-hint">{card.note}</p> : null}
+      {card.pending_filename ? (
+        <p className="tool-card-hint">待指定角色：{card.pending_filename}</p>
+      ) : null}
+      {card.pending_prior_filename ? (
+        <p className="tool-card-hint">待确认 prior：{card.pending_prior_filename}</p>
+      ) : null}
+      {!needRolePick && priorOptions.length ? (
+        <div className="tool-card-hint" style={{ marginBottom: 8 }}>
+          <label>
+            花名册 prior{" "}
+            <select
+              value={priorJobId}
+              disabled={actionsDisabled}
+              onChange={(e) => setPriorJobId(e.target.value)}
+            >
+              <option value="">请选择…</option>
+              {priorOptions.map((j) => (
+                <option key={j.id} value={j.id}>
+                  {j.prior_source === "prior_import" ? "导入·" : "确认·"}
+                  {j.id.slice(0, 8)}… · {j.person_count} 人
+                  {j.year ? ` · ${j.year}-${String(j.month || 0).padStart(2, "0")}` : ""}
+                </option>
+              ))}
+            </select>
+          </label>{" "}
+          <button
+            type="button"
+            disabled={actionsDisabled || !priorJobId}
+            onClick={() => run("attendance_summary.set_prior", { prior_job_id: priorJobId })}
+          >
+            设为底表
+          </button>
+        </div>
+      ) : null}
+      <ul className="tool-card-list">
+        {roles.map((r) => (
+          <li key={r.role}>
+            {r.filled ? "✓" : "○"} {r.label}
+            {r.filename ? ` · ${r.filename}` : " · 未上传"}
+          </li>
+        ))}
+      </ul>
+      {openWarnings.length ? (
+        <>
+          <p className="muted tool-card-hint">确认前须处理下列阻塞告警。</p>
+          <ul className="tool-card-list">
+            {openWarnings.slice(0, 40).map((w, i) => {
+              const id = w.id || `${w.code}-${i}`;
+              const isNonCompany =
+                w.type === "non_company_punch_present" ||
+                String(id).includes("non_company_punch");
+              const isLeaveTravel =
+                w.type === "leave_travel_conflict" ||
+                (String(id).startsWith("conflict:") && !isNonCompany);
+              const isConflict =
+                w.type === "conflict" || isLeaveTravel || isNonCompany;
+              const isHr = w.type === "hr_diff" || String(id).startsWith("hr_");
+              return (
+                <li key={id}>
+                  <div>
+                    <strong>{w.code || w.type || "warn"}</strong> — {w.message}
+                  </div>
+                  {isNonCompany ? (
+                    <span className="tool-card-actions">
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          run("attendance_summary.resolve_conflict", {
+                            warning_id: id,
+                            prefer: "present",
+                          })
+                        }
+                      >
+                        按建议计入
+                      </button>
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          run("attendance_summary.resolve_conflict", {
+                            warning_id: id,
+                            prefer: "full_day",
+                          })
+                        }
+                      >
+                        全天计入
+                      </button>
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          run("attendance_summary.resolve_conflict", {
+                            warning_id: id,
+                            prefer: "ignore",
+                          })
+                        }
+                      >
+                        不计入
+                      </button>
+                    </span>
+                  ) : null}
+                  {isLeaveTravel || (isConflict && !isNonCompany) ? (
+                    <span className="tool-card-actions">
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          run("attendance_summary.resolve_conflict", {
+                            warning_id: id,
+                            prefer: "travel",
+                          })
+                        }
+                      >
+                        优先出差
+                      </button>
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          run("attendance_summary.resolve_conflict", {
+                            warning_id: id,
+                            prefer: "leave",
+                          })
+                        }
+                      >
+                        优先请假
+                      </button>
+                    </span>
+                  ) : null}
+                  {isHr ? (
+                    <span className="tool-card-actions">
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          run("attendance_summary.resolve_hr", {
+                            warning_id: id,
+                            accept: true,
+                          })
+                        }
+                      >
+                        接受
+                      </button>
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() =>
+                          run("attendance_summary.resolve_hr", {
+                            warning_id: id,
+                            accept: false,
+                          })
+                        }
+                      >
+                        忽略
+                      </button>
+                    </span>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      ) : null}
+      {qualityUnackedCount > 0 || hasAckAction ? (
+        <>
+          <p className="muted tool-card-hint">
+            确认前须逐条或全部知悉数据质量问题（共 {qualityUnackedCount || "若干"}{" "}
+            条；知悉不改日格；每页 {qualityPageSize} 条）。
+            {qualitySummary
+              ? ` 分类：${Object.entries(qualitySummary)
+                  .map(([k, v]) => `${k} ${v}`)
+                  .join("、")}`
+              : ""}
+          </p>
+          <ul className="tool-card-list">
+            {qualityPageItems.map((w, i) => {
+              const id = w.id || "";
+              return (
+                <li key={id || `dq-${qualityPageSafe}-${i}`}>
+                  <div>
+                    <strong>{w.code || "data_quality"}</strong> — {w.message}
+                  </div>
+                  {id ? (
+                    <span className="tool-card-actions">
+                      <button
+                        type="button"
+                        className="linkish"
+                        disabled={actionsDisabled}
+                        onClick={() => onAckQualityOne(id)}
+                      >
+                        知悉
+                      </button>
+                    </span>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+          {qualityWarnings.length > qualityPageSize ? (
+            <div className="tool-card-actions" style={{ marginBottom: 8 }}>
+              <button
+                type="button"
+                className="linkish"
+                disabled={actionsDisabled || qualityPageSafe <= 0}
+                onClick={() => setQualityPage((p) => Math.max(0, p - 1))}
+              >
+                上一页
+              </button>
+              <span className="muted">
+                第 {qualityPageSafe + 1} / {qualityPageCount} 页（
+                {qualityPageSafe * qualityPageSize + 1}–
+                {Math.min(
+                  (qualityPageSafe + 1) * qualityPageSize,
+                  qualityWarnings.length
+                )}
+                /{qualityWarnings.length}）
+              </span>
+              <button
+                type="button"
+                className="linkish"
+                disabled={actionsDisabled || qualityPageSafe >= qualityPageCount - 1}
+                onClick={() =>
+                  setQualityPage((p) => Math.min(qualityPageCount - 1, p + 1))
+                }
+              >
+                下一页
+              </button>
+            </div>
+          ) : null}
+        </>
+      ) : null}
+      {error ? <p className="tool-card-error">{error}</p> : null}
+      <div className="tool-card-actions">
+        {needRolePick
+          ? (card.actions || [])
+              .filter((a) => String(a.id).startsWith("attendance_summary.pick_role"))
+              .map((a) => (
+                <button
+                  key={a.id}
+                  type="button"
+                  disabled={actionsDisabled}
+                  onClick={() => run(a.id, { role: a.id.split(":")[1] })}
+                >
+                  {a.label}
+                </button>
+              ))
+          : null}
+        {!needRolePick && !periodConfirmed && card.status !== "voided" ? (
+          <>
+            {(card.period_options || []).map((opt) => {
+              const same =
+                Number(opt.year) === Number(card.year) &&
+                Number(opt.month) === Number(card.month);
+              if (same) return null;
+              const ym = `${opt.year}-${String(opt.month).padStart(2, "0")}`;
+              return (
+                <button
+                  key={ym}
+                  type="button"
+                  disabled={actionsDisabled}
+                  onClick={() =>
+                    run(`attendance_summary.set_period:${ym}`, {
+                      year: opt.year,
+                      month: opt.month,
+                    })
+                  }
+                >
+                  {String(opt.label || "").startsWith("上月") ? "上月" : String(opt.label || "").startsWith("本月") ? "本月" : opt.label}
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              disabled={actionsDisabled}
+              onClick={() =>
+                run("attendance_summary.confirm_period", {
+                  acknowledge_incomplete_month: Boolean(card.month_incomplete),
+                })
+              }
+            >
+              确认账期
+            </button>
+          </>
+        ) : null}
+        {!needRolePick && periodConfirmed && !calendarConfirmed && card.status !== "voided" ? (
+          <button
+            type="button"
+            disabled={actionsDisabled}
+            onClick={() => run("attendance_summary.confirm_calendar", {})}
+          >
+            确认非出勤日
+          </button>
+        ) : null}
+        {!needRolePick && card.pending_prior_filename ? (
+          <>
+            <button
+              type="button"
+              disabled={actionsDisabled}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    `确认将「${card.pending_prior_filename}」导入为 prior 花名册？`
+                  )
+                ) {
+                  return;
+                }
+                run("attendance_summary.confirm_prior", {});
+              }}
+            >
+              用上传台账作 prior
+            </button>
+            <button
+              type="button"
+              disabled={actionsDisabled}
+              onClick={() => run("attendance_summary.dismiss_prior", {})}
+            >
+              取消上传台账
+            </button>
+          </>
+        ) : null}
+        {!needRolePick &&
+        periodConfirmed &&
+        calendarConfirmed &&
+        card.has_roster &&
+        (card.missing_roles || []).length === 0 ? (
+          <button
+            type="button"
+            disabled={actionsDisabled}
+            onClick={() => run("attendance_summary.recompute", {})}
+          >
+            重算
+          </button>
+        ) : null}
+        {!needRolePick && (qualityUnackedCount > 0 || hasAckAction) ? (
+          <button type="button" disabled={actionsDisabled} onClick={onAckQualityAll}>
+            全部知悉（{qualityUnackedCount || "全部"}）
+          </button>
+        ) : null}
+        {!needRolePick && canConfirm ? (
+          <button type="button" disabled={actionsDisabled} onClick={onConfirm}>
+            确认台账
+          </button>
+        ) : null}
+        {!needRolePick &&
+        !canConfirm &&
+        qualityUnackedCount > 0 &&
+        pendingCount === 0 &&
+        periodConfirmed &&
+        calendarConfirmed &&
+        card.status === "computed" ? (
+          <button type="button" disabled title="请先全部知悉数据质量告警">
+            确认台账（待知悉）
+          </button>
+        ) : null}
+        {!needRolePick && card.row_count > 0 && card.status !== "voided" ? (
+          <button type="button" disabled={actionsDisabled} onClick={onPreviewExport}>
+            {exportBusy ? "导出中…" : "预览导出"}
+          </button>
+        ) : null}
+        {!needRolePick && card.status === "confirmed" ? (
+          <button type="button" disabled={actionsDisabled} onClick={onExport}>
+            {exportBusy ? "导出中…" : "导出 Excel"}
+          </button>
+        ) : null}
+        {!needRolePick && card.status !== "voided" ? (
+          <button type="button" disabled={actionsDisabled} onClick={onVoid}>
+            作废
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function LeaveLedgerJobCard({ card, disabled, onAction }) {
   const [error, setError] = useState("");
   const [exportBusy, setExportBusy] = useState(false);
   const [resolutions, setResolutions] = useState({});
   const [busy, setBusy] = useState(false);
+  const [priorJobId, setPriorJobId] = useState("");
 
   const roles = card.roles || [];
   const needRolePick = Boolean(card.need_role_pick);
@@ -567,7 +1126,20 @@ function LeaveLedgerJobCard({ card, disabled, onAction }) {
     await run("leave_ledger.void", { confirmed: true, reason: "对话中作废" });
   };
 
+  const onMergePrior = async () => {
+    if (!priorJobId) {
+      setError("请先选择 prior 台账");
+      return;
+    }
+    await run("leave_ledger.merge", { prior_job_id: priorJobId });
+  };
+
   const actionsDisabled = disabled || busy || exportBusy;
+  const priorOptions = card.prior_options || [];
+  const canMergePrior =
+    !needRolePick &&
+    (card.status === "parsed" || card.status === "needs_review") &&
+    (card.row_count || 0) > 0;
 
   return (
     <div className="tool-card">
@@ -576,10 +1148,42 @@ function LeaveLedgerJobCard({ card, disabled, onAction }) {
         {card.job_id?.slice(0, 8)}… · {card.status}
         {pendingCount ? ` · 待决议 ${pendingCount}` : ""}
         {card.row_count != null ? ` · ${card.row_count} 人` : ""}
+        {card.merged_from_job_id
+          ? ` · 已合 ${String(card.merged_from_job_id).slice(0, 8)}…`
+          : ""}
       </p>
       {card.note ? <p className="muted tool-card-hint">{card.note}</p> : null}
       {card.pending_filename ? (
         <p className="tool-card-hint">待指定角色：{card.pending_filename}</p>
+      ) : null}
+      {card.pending_prior_filename ? (
+        <p className="tool-card-hint">
+          待确认 prior 台账：{card.pending_prior_filename}（未计入四源）
+        </p>
+      ) : null}
+      {canMergePrior && priorOptions.length ? (
+        <div className="tool-card-hint" style={{ marginBottom: 8 }}>
+          <label>
+            合并 prior{" "}
+            <select
+              value={priorJobId}
+              disabled={actionsDisabled}
+              onChange={(e) => setPriorJobId(e.target.value)}
+            >
+              <option value="">请选择…</option>
+              {priorOptions.map((j) => (
+                <option key={j.id} value={j.id}>
+                  {j.prior_source === "export_import" ? "导入·" : "确认·"}
+                  {j.id.slice(0, 8)}… · {j.person_count} 人
+                  {j.confirmed_at ? ` · ${String(j.confirmed_at).slice(0, 10)}` : ""}
+                </option>
+              ))}
+            </select>
+          </label>{" "}
+          <button type="button" disabled={actionsDisabled || !priorJobId} onClick={onMergePrior}>
+            合并写回
+          </button>
+        </div>
       ) : null}
       <ul className="tool-card-list">
         {roles.map((r) => (
@@ -798,6 +1402,33 @@ function LeaveLedgerJobCard({ card, disabled, onAction }) {
                 </button>
               ))
           : null}
+        {!needRolePick && card.pending_prior_filename ? (
+          <>
+            <button
+              type="button"
+              disabled={actionsDisabled}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    `确认将「${card.pending_prior_filename}」导入为 prior 并合并到当前任务？`
+                  )
+                ) {
+                  return;
+                }
+                run("leave_ledger.confirm_prior_merge", {});
+              }}
+            >
+              用上传台账合并
+            </button>
+            <button
+              type="button"
+              disabled={actionsDisabled}
+              onClick={() => run("leave_ledger.dismiss_prior", {})}
+            >
+              取消上传台账
+            </button>
+          </>
+        ) : null}
         {!needRolePick && hasLocalResolutions ? (
           <button type="button" disabled={actionsDisabled} onClick={onSubmitReview}>
             提交复核决议
@@ -849,7 +1480,7 @@ export default function ChatPage() {
   const [tools, setTools] = useState([]);
   const [activeTool, setActiveTool] = useState("");
   const [toolMenuOpen, setToolMenuOpen] = useState(false);
-  const [attachment, setAttachment] = useState(null);
+  const [attachments, setAttachments] = useState([]);
   const [attachBusy, setAttachBusy] = useState(false);
   const galleryFor = (message) => (message.citations || []).flatMap((item) => item.images || []);
 
@@ -954,7 +1585,7 @@ export default function ChatPage() {
     setConversationTitle(conversation.title || "新对话");
     setMessages([]);
     setMemory(null);
-    setAttachment(null);
+    setAttachments([]);
     setActiveTool("");
     setConversations(rows);
     setEditingTitleId(null);
@@ -1020,7 +1651,7 @@ export default function ChatPage() {
         setConversationTitle("新对话");
         setMessages([]);
         setMemory(null);
-        setAttachment(null);
+        setAttachments([]);
       }
       setSessionError("");
     } catch (err) {
@@ -1029,19 +1660,33 @@ export default function ChatPage() {
   };
 
   const onPickAttachment = async (event) => {
-    const file = event.target.files?.[0];
+    const files = [...(event.target.files || [])];
     event.target.value = "";
-    if (!file) return;
-    const lower = (file.name || "").toLowerCase();
-    if (!lower.endsWith(".xlsx") && !lower.endsWith(".xls") && !lower.endsWith(".pdf")) {
-      setSessionError("仅支持 Excel（.xlsx）或由该工作簿导出的 PDF");
+    if (!files.length) return;
+    for (const file of files) {
+      const lower = (file.name || "").toLowerCase();
+      if (!lower.endsWith(".xlsx") && !lower.endsWith(".xls") && !lower.endsWith(".pdf")) {
+        setSessionError(`不支持的文件：${file.name}（仅 .xlsx / .xls / .pdf）`);
+        return;
+      }
+    }
+    const room = Math.max(0, 8 - attachments.length);
+    if (!room) {
+      setSessionError("最多同时附加 8 个文件");
       return;
     }
+    const toUpload = files.slice(0, room);
     setAttachBusy(true);
     setSessionError("");
     try {
-      const meta = await uploadChatAttachment(file);
-      setAttachment(meta);
+      const metas = [];
+      for (const file of toUpload) {
+        metas.push(await uploadChatAttachment(file));
+      }
+      setAttachments((prev) => [...prev, ...metas].slice(0, 8));
+      if (files.length > room) {
+        setSessionError(`已达上限，仅附加前 ${room} 个文件`);
+      }
     } catch (err) {
       setSessionError(err.message || "附件上传失败");
     } finally {
@@ -1056,7 +1701,12 @@ export default function ChatPage() {
       await chatToolAction({ conversationId, action, payload });
       setMessages(await getMessages(conversationId));
     } catch (err) {
-      setSessionError(err.message || "工具动作失败");
+      const msg = err?.message;
+      setSessionError(
+        typeof msg === "string" && msg && msg !== "[object Object]"
+          ? msg
+          : "工具动作失败"
+      );
     } finally {
       setLoading(false);
     }
@@ -1064,25 +1714,33 @@ export default function ChatPage() {
 
   const send = async (rawText) => {
     const text = (rawText ?? input).trim();
-    if ((!text && !attachment) || loading) return;
-    const outbound = text || (attachment ? `请处理附件 ${attachment.filename}` : "");
+    if ((!text && !attachments.length) || loading) return;
+    const attachList = [...attachments];
+    const names = attachList.map((a) => a.filename).filter(Boolean);
+    const outbound =
+      text ||
+      (names.length === 1
+        ? `请处理附件 ${names[0]}`
+        : names.length
+          ? `请处理附件：${names.join("、")}`
+          : "");
     setInput("");
     setLoading(true);
     setSessionError("");
 
     let currentId = conversationId;
     let currentTitle = conversationTitle;
-    const attachMeta = attachment;
+    const attachLine = names.length ? `\n[附件] ${names.join("、")}` : "";
     const optimisticMessages = [
       ...messages,
       {
         role: "user",
-        content: attachMeta ? `${outbound}\n[附件] ${attachMeta.filename}` : outbound,
+        content: `${outbound}${attachLine}`,
       },
       { role: "assistant", content: "", streaming: true },
     ];
     setMessages(optimisticMessages);
-    setAttachment(null);
+    setAttachments([]);
 
     let assembled = "";
     try {
@@ -1090,7 +1748,7 @@ export default function ChatPage() {
         message: outbound,
         conversationId: currentId,
         activeTool: activeTool,
-        attachmentId: attachMeta?.id || null,
+        attachmentIds: attachList.map((a) => a.id).filter(Boolean),
         onStart: (data) => {
           currentId = data.conversation_id;
           applyConversationId(currentId);
@@ -1377,6 +2035,13 @@ export default function ChatPage() {
                             onAction={(action, payload) => runToolAction(action, payload)}
                           />
                         ) : null}
+                        {message.meta?.card?.type === "attendance_summary_job" ? (
+                          <AttendanceSummaryJobCard
+                            card={message.meta.card}
+                            disabled={loading}
+                            onAction={(action, payload) => runToolAction(action, payload)}
+                          />
+                        ) : null}
                         {message.citations?.length > 0 && (
                           <div className="citations">
                             {message.citations.map((citation) => (
@@ -1448,12 +2113,22 @@ export default function ChatPage() {
 
         <footer className="composer-wrap">
           {sessionError ? <div className="composer-error">{sessionError}</div> : null}
-          {attachment ? (
+          {attachments.length ? (
             <div className="composer-attach-chip">
-              已附加：{attachment.filename}
-              <button type="button" onClick={() => setAttachment(null)}>
-                移除
-              </button>
+              已附加 {attachments.length} 个：
+              {attachments.map((a) => (
+                <span key={a.id} style={{ marginLeft: 6 }}>
+                  {a.filename}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAttachments((prev) => prev.filter((x) => x.id !== a.id))
+                    }
+                  >
+                    移除
+                  </button>
+                </span>
+              ))}
             </div>
           ) : null}
           <div className="composer">
@@ -1471,10 +2146,11 @@ export default function ChatPage() {
               }}
             />
             <div className="composer-tools">
-              <label className="composer-icon-btn" title="上传 Excel（.xlsx）或由其导出的 PDF" aria-label="上传 Excel 或 PDF">
+              <label className="composer-icon-btn" title="上传 Excel（.xlsx）或 PDF，可多选" aria-label="上传 Excel 或 PDF，可多选">
                 <input
                   type="file"
                   accept=".xlsx,.xls,.pdf"
+                  multiple
                   hidden
                   disabled={attachBusy || loading}
                   onChange={onPickAttachment}
@@ -1539,7 +2215,7 @@ export default function ChatPage() {
               <button
                 className="send"
                 onClick={() => send()}
-                disabled={(!input.trim() && !attachment) || loading}
+                disabled={(!input.trim() && !attachments.length) || loading}
                 title="发送"
               >
                 {loading ? (

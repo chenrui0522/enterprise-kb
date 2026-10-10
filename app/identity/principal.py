@@ -24,6 +24,7 @@ class Principal:
     # Department dual-gate (computed at load; admin / users:manage forces True).
     staffing_org_ok: bool = False
     leave_ledger_org_ok: bool = False
+    attendance_summary_org_ok: bool = False
 
     def has_permission(self, code: str) -> bool:
         return code in self.permissions

@@ -6,16 +6,23 @@ from dataclasses import dataclass
 
 from app.core.errors import AppError
 from app.identity.constants import (
+    PERM_ATTENDANCE_SUMMARY_READ,
+    PERM_ATTENDANCE_SUMMARY_WRITE,
     PERM_LEAVE_LEDGER_READ,
     PERM_LEAVE_LEDGER_WRITE,
     PERM_STAFFING_READ,
     PERM_STAFFING_WRITE,
 )
-from app.identity.feature_gates import can_use_leave_ledger, can_use_staffing
+from app.identity.feature_gates import (
+    can_use_attendance_summary,
+    can_use_leave_ledger,
+    can_use_staffing,
+)
 from app.identity.principal import Principal
 
 TOOL_STAFFING = "staffing"
 TOOL_LEAVE_LEDGER = "leave_ledger"
+TOOL_ATTENDANCE_SUMMARY = "attendance_summary"
 
 WEAK_CLARIFY_COPY = (
     "看到你发了表格或提到相关需求。是要做「人员投入」统计（导入项目日报、看谁在场几天），"
@@ -25,6 +32,11 @@ WEAK_CLARIFY_COPY = (
 LEAVE_WEAK_CLARIFY_COPY = (
     "看到你发了考勤类表格或提到相关需求。是要做「调休台账」（出差/加班/请假/打卡对账），"
     "还是只要讲解表格内容？请回复「调休台账」或「只要讲解」。"
+)
+
+ATTENDANCE_WEAK_CLARIFY_COPY = (
+    "看到你发了考勤汇总相关表格或提到「考勤汇总/太原台账」。"
+    "是要做「考勤汇总台账」，还是只要讲解表格内容？请回复「考勤汇总台账」或「只要讲解」。"
 )
 
 TOOL_CONFLICT_CLARIFY_COPY = (
@@ -51,6 +63,13 @@ CHAT_TOOLS: tuple[ChatTool, ...] = (
         label="调休台账",
         permissions=frozenset({PERM_LEAVE_LEDGER_READ, PERM_LEAVE_LEDGER_WRITE}),
     ),
+    ChatTool(
+        id=TOOL_ATTENDANCE_SUMMARY,
+        label="考勤汇总台账",
+        permissions=frozenset(
+            {PERM_ATTENDANCE_SUMMARY_READ, PERM_ATTENDANCE_SUMMARY_WRITE}
+        ),
+    ),
 )
 
 
@@ -68,6 +87,10 @@ def list_tools_for_principal(principal: Principal) -> list[dict[str, str]]:
             out.append({"id": tool.id, "label": tool.label})
         elif tool.id == TOOL_LEAVE_LEDGER and can_use_leave_ledger(principal, write=None):
             out.append({"id": tool.id, "label": tool.label})
+        elif tool.id == TOOL_ATTENDANCE_SUMMARY and can_use_attendance_summary(
+            principal, write=None
+        ):
+            out.append({"id": tool.id, "label": tool.label})
     return out
 
 
@@ -80,6 +103,9 @@ def ensure_tool_allowed(principal: Principal, tool_id: str) -> ChatTool:
             raise AppError("无权使用该工具", status_code=403)
     elif tool_id == TOOL_LEAVE_LEDGER:
         if not can_use_leave_ledger(principal, write=None):
+            raise AppError("无权使用该工具", status_code=403)
+    elif tool_id == TOOL_ATTENDANCE_SUMMARY:
+        if not can_use_attendance_summary(principal, write=None):
             raise AppError("无权使用该工具", status_code=403)
     else:
         raise AppError("无权使用该工具", status_code=403)

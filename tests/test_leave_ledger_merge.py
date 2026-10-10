@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from app.leave_ledger.merge import (
     filter_warnings_covered_by_prior,
     merge_ledger_rows,
@@ -124,6 +126,46 @@ def test_synthesize_missing_travel_segments() -> None:
     current = [{"person_name": "丁", "travel_segments": [], "ot_days": [], "leave_segments": []}]
     merged = merge_ledger_rows(prior, current)
     assert merged[0]["travel_comp_days"] == 2.0
+
+
+def test_merge_strips_non_holiday_ot_inside_united_travel() -> None:
+    """Prior credited weekend OT outside travel; after travel union only 法定本体日 remains."""
+    prior = [
+        {
+            "person_name": "戊",
+            "travel_segments": [],
+            "ot_days": [
+                {"date": "2026-06-19", "credit": 1.0, "holiday": True},
+                {"date": "2026-06-20", "credit": 1.0, "holiday": False},
+                {"date": "2026-06-21", "credit": 1.0, "holiday": False},
+            ],
+            "leave_segments": [],
+        }
+    ]
+    current = [
+        {
+            "person_name": "戊",
+            "travel_segments": [
+                {
+                    "system_start": "2026-06-01",
+                    "system_end": "2026-07-03",
+                    "actual_start": "2026-06-01",
+                    "actual_end": "2026-07-03",
+                    "credit": 2.0,
+                }
+            ],
+            "ot_days": [],
+            "leave_segments": [],
+        }
+    ]
+    merged = merge_ledger_rows(
+        prior,
+        current,
+        holidays={date(2026, 6, 19)},
+    )
+    assert merged[0]["ot_comp_days"] == 1.0
+    assert [d["date"] for d in merged[0]["ot_days"]] == ["2026-06-19"]
+    assert merged[0]["total_comp_days"] == 3.0  # travel 2 + ot 1
 
 
 def test_filter_warnings_covered_by_prior() -> None:

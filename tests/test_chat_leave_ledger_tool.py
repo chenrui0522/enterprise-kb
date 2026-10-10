@@ -23,6 +23,7 @@ from app.identity.constants import (
     PERM_LEAVE_LEDGER_WRITE,
 )
 from app.identity.principal import Principal
+from app.leave_ledger import service as leave_service
 from app.models.entity import Conversation
 import app.models.entity  # noqa: F401
 import app.models.identity  # noqa: F401
@@ -288,6 +289,190 @@ async def test_incremental_upload_same_job_and_role_pick(tmp_path, monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_ask_current_job_person_and_summary(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KB_DOCUMENT_STORAGE_DIR", str(tmp_path / "storage"))
+    get_settings.cache_clear()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'leave-ask.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal()
+
+    async with factory() as session:
+        conversation = Conversation(
+            tenant_id="autley", title="调休", created_by=principal.user_id
+        )
+        session.add(conversation)
+        await session.commit()
+        await session.refresh(conversation)
+        update_leave_ledger_state(conversation, active_tool=TOOL_LEAVE_LEDGER)
+
+        seeded = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="上传",
+            attachment={"filename": "出差申请.xlsx", "data": _travel_xlsx()},
+        )
+        job_id = seeded["card"]["job_id"]
+        job = await leave_service.get_job(session, principal.tenant_id, job_id)
+        job.compute_result = {
+            "rows": [
+                {
+                    "person_name": "甲",
+                    "travel_comp_days": 2,
+                    "ot_comp_days": 1,
+                    "total_comp_days": 3,
+                    "used_comp_days": 1,
+                    "remaining_comp_days": 2,
+                    "remark": "demo",
+                }
+            ],
+            "totals": {
+                "person_count": 1,
+                "total_comp_days": 3,
+                "used_comp_days": 1,
+                "remaining_comp_days": 2,
+            },
+            "warnings": [],
+        }
+        await session.commit()
+
+        rem = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="甲剩余调休多少",
+            attachment=None,
+        )
+        assert "剩余调休 2 天" in rem["content"]
+        assert rem["card"]["job_id"] == job_id
+
+        summary = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="多少人汇总",
+            attachment=None,
+        )
+        assert "共 1 人" in summary["content"]
+
+        missing = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="乙出差可调休几天",
+            attachment=None,
+        )
+        assert "未在当前台账结果中找到" in missing["content"]
+
+
+@pytest.mark.asyncio
+async def test_ask_without_job_does_not_invent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KB_DOCUMENT_STORAGE_DIR", str(tmp_path / "storage"))
+    get_settings.cache_clear()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'leave-ask0.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal()
+
+    async with factory() as session:
+        conversation = Conversation(
+            tenant_id="autley", title="调休", created_by=principal.user_id
+        )
+        session.add(conversation)
+        await session.commit()
+        await session.refresh(conversation)
+        update_leave_ledger_state(conversation, active_tool=TOOL_LEAVE_LEDGER)
+
+        result = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="张三剩余调休几天",
+            attachment=None,
+        )
+        assert "还没有调休台账计算结果" in result["content"]
+        assert result["card"] is None
+
+
+@pytest.mark.asyncio
+async def test_multi_attach_same_turn_two_roles(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KB_DOCUMENT_STORAGE_DIR", str(tmp_path / "storage"))
+    get_settings.cache_clear()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'leave-multi.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal()
+
+    async with factory() as session:
+        conversation = Conversation(
+            tenant_id="autley", title="调休", created_by=principal.user_id
+        )
+        session.add(conversation)
+        await session.commit()
+        await session.refresh(conversation)
+        update_leave_ledger_state(conversation, active_tool=TOOL_LEAVE_LEDGER)
+
+        result = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="一次两份",
+            attachments=[
+                {"filename": "出差申请.xlsx", "data": _travel_xlsx()},
+                {"filename": "加班申请.xlsx", "data": _overtime_xlsx()},
+            ],
+        )
+        assert result["card"]["job_id"]
+        by_role = {r["role"]: r["filled"] for r in result["card"]["roles"]}
+        assert by_role["travel"] is True
+        assert by_role["overtime"] is True
+        assert "本轮已收录 2 份" in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_multi_attach_stops_at_ambiguous(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KB_DOCUMENT_STORAGE_DIR", str(tmp_path / "storage"))
+    get_settings.cache_clear()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'leave-amb.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal()
+
+    async with factory() as session:
+        conversation = Conversation(
+            tenant_id="autley", title="调休", created_by=principal.user_id
+        )
+        session.add(conversation)
+        await session.commit()
+        await session.refresh(conversation)
+        update_leave_ledger_state(conversation, active_tool=TOOL_LEAVE_LEDGER)
+
+        result = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="混合",
+            attachments=[
+                {"filename": "出差申请.xlsx", "data": _travel_xlsx()},
+                {"filename": "mystery.xlsx", "data": _ambiguous_xlsx()},
+                {"filename": "加班申请.xlsx", "data": _overtime_xlsx()},
+            ],
+        )
+        assert result["card"]["need_role_pick"] is True
+        by_role = {r["role"]: r["filled"] for r in result["card"]["roles"]}
+        assert by_role["travel"] is True
+        assert by_role["overtime"] is False
+        assert "本轮已收录" in result["content"]
+        assert "加班申请.xlsx" in result["content"]
+        assert conversation.tool_state["leave_ledger"].get("pending_attachment")
+
+
+@pytest.mark.asyncio
 async def test_void_requires_confirm_and_write(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("KB_DOCUMENT_STORAGE_DIR", str(tmp_path / "storage"))
     get_settings.cache_clear()
@@ -343,3 +528,187 @@ async def test_void_requires_confirm_and_write(tmp_path, monkeypatch) -> None:
             payload={"job_id": job_id, "confirmed": True},
         )
         assert voided["card"]["status"] == "voided"
+
+
+@pytest.mark.asyncio
+async def test_chat_merge_with_confirmed_prior(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KB_DOCUMENT_STORAGE_DIR", str(tmp_path / "storage"))
+    get_settings.cache_clear()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'leave-mrg.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal()
+
+    async with factory() as session:
+        conversation = Conversation(
+            tenant_id="autley", title="调休", created_by=principal.user_id
+        )
+        session.add(conversation)
+        await session.commit()
+        await session.refresh(conversation)
+        update_leave_ledger_state(conversation, active_tool=TOOL_LEAVE_LEDGER)
+
+        seeded = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="上传",
+            attachment={"filename": "出差申请.xlsx", "data": _travel_xlsx()},
+        )
+        job_id = seeded["card"]["job_id"]
+        job = await leave_service.get_job(session, principal.tenant_id, job_id)
+        job.status = "parsed"
+        job.compute_result = {
+            "rows": [
+                {
+                    "person_name": "甲",
+                    "ot_days": [{"date": "2026-02-01", "credit": 1.0}],
+                    "travel_segments": [],
+                    "leave_segments": [],
+                }
+            ]
+        }
+        job.warnings = []
+        await session.commit()
+
+        from app.models.leave_ledger import LeaveLedgerJob, LeaveLedgerSnapshot
+
+        prior = LeaveLedgerJob(
+            id="prior1",
+            tenant_id="autley",
+            status="confirmed",
+            created_by=principal.user_id,
+            compute_result={"rows": []},
+            confirmed_at=None,
+            warnings=[],
+            resolved_warnings={},
+        )
+        session.add(prior)
+        await session.flush()
+        session.add(
+            LeaveLedgerSnapshot(
+                tenant_id="autley",
+                job_id="prior1",
+                rows=[
+                    {
+                        "person_name": "甲",
+                        "ot_days": [{"date": "2026-01-05", "credit": 0.5}],
+                        "travel_segments": [],
+                        "leave_segments": [],
+                    }
+                ],
+            )
+        )
+        await session.commit()
+
+        with pytest.raises(AppError) as missing:
+            await apply_leave_ledger_action(
+                session,
+                principal=principal,
+                conversation=conversation,
+                action="leave_ledger.merge",
+                payload={"job_id": job_id},
+            )
+        assert missing.value.status_code == 400
+
+        merged = await apply_leave_ledger_action(
+            session,
+            principal=principal,
+            conversation=conversation,
+            action="leave_ledger.merge",
+            payload={"job_id": job_id, "prior_job_id": "prior1"},
+        )
+        assert "已合并" in merged["content"]
+        assert merged["card"]["merged_from_job_id"] == "prior1"
+
+
+@pytest.mark.asyncio
+async def test_chat_export_xlsx_not_four_source_slot(tmp_path, monkeypatch) -> None:
+    from app.leave_ledger.export import build_ledger_xlsx
+
+    monkeypatch.setenv("KB_DOCUMENT_STORAGE_DIR", str(tmp_path / "storage"))
+    get_settings.cache_clear()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'leave-exp.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal()
+    export_bytes = build_ledger_xlsx(
+        [
+            {
+                "person_name": "甲",
+                "center": "",
+                "department": "",
+                "travel_segments": [],
+                "ot_days": [{"date": "2026-01-05", "credit": 0.5}],
+                "leave_segments": [],
+                "total_comp_days": 0.5,
+                "used_comp_days": 0.0,
+                "remaining_comp_days": 0.5,
+                "remark": "",
+            }
+        ]
+    )
+
+    async with factory() as session:
+        conversation = Conversation(
+            tenant_id="autley", title="调休", created_by=principal.user_id
+        )
+        session.add(conversation)
+        await session.commit()
+        await session.refresh(conversation)
+        update_leave_ledger_state(conversation, active_tool=TOOL_LEAVE_LEDGER)
+
+        seeded = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="上传",
+            attachment={"filename": "出差申请.xlsx", "data": _travel_xlsx()},
+        )
+        job_id = seeded["card"]["job_id"]
+        job = await leave_service.get_job(session, principal.tenant_id, job_id)
+        job.status = "parsed"
+        job.compute_result = {
+            "rows": [
+                {
+                    "person_name": "甲",
+                    "ot_days": [{"date": "2026-02-01", "credit": 1.0}],
+                    "travel_segments": [],
+                    "leave_segments": [],
+                }
+            ]
+        }
+        job.warnings = []
+        await session.commit()
+
+        offered = await handle_leave_ledger_message(
+            session,
+            principal=principal,
+            conversation=conversation,
+            message="上月台账",
+            attachment={"filename": "上月台账.xlsx", "data": export_bytes},
+        )
+        assert "未计入四源" in offered["content"]
+        assert offered["card"]["pending_prior_filename"]
+        by_role = {r["role"]: r["filled"] for r in offered["card"]["roles"]}
+        assert by_role["travel"] is True
+        assert by_role["overtime"] is False
+
+        done = await apply_leave_ledger_action(
+            session,
+            principal=principal,
+            conversation=conversation,
+            action="leave_ledger.confirm_prior_merge",
+            payload={"job_id": job_id},
+        )
+        assert "已导入" in done["content"]
+        assert done["card"]["merged_from_job_id"]
+        dates = {
+            d["date"]: d["credit"]
+            for d in (
+                await leave_service.get_job(session, principal.tenant_id, job_id)
+            ).compute_result["rows"][0]["ot_days"]
+        }
+        assert dates["2026-01-05"] == 0.5

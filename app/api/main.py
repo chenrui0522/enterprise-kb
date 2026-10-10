@@ -22,7 +22,16 @@ from app.identity.constants import DEFAULT_TENANT_ID
 from app.providers.factory import build_embedder, build_llm, build_reranker
 from app.retrieval.milvus_store import MilvusStore
 from app.retrieval.service import SearchService
-from app.api.routers import auth, chat, documents, leave_ledger, org, staffing, system
+from app.api.routers import (
+    attendance_summary,
+    auth,
+    chat,
+    documents,
+    leave_ledger,
+    org,
+    staffing,
+    system,
+)
 
 logger = get_logger("api")
 
@@ -137,6 +146,7 @@ def create_app() -> FastAPI:
     app.include_router(documents.router, prefix="/api/v1")
     app.include_router(staffing.router, prefix="/api/v1")
     app.include_router(leave_ledger.router, prefix="/api/v1")
+    app.include_router(attendance_summary.router, prefix="/api/v1")
     return app
 
 

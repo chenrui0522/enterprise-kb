@@ -49,5 +49,16 @@ class LeaveLedgerJobSummaryOut(BaseModel):
     confirmed_at: datetime | None = None
     created_at: datetime | None = None
     person_count: int = 0
+    prior_source: str = "confirmed"  # confirmed | export_import
 
     model_config = {"from_attributes": True}
+
+
+class LeaveLedgerImportPriorOut(BaseModel):
+    id: str
+    status: str
+    person_count: int = 0
+    prior_source: str = "export_import"
+    confirmed_at: datetime | None = None
+    created_at: datetime | None = None
+

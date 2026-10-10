@@ -1,6 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import App from "./App.jsx";
 import { AuthProvider } from "./auth.jsx";
 import AdminPage from "./pages/AdminPage.jsx";
@@ -22,6 +22,9 @@ ReactDOM.createRoot(document.getElementById("root")).render(
             <Route path="documents" element={<DocumentsPage />} />
             <Route path="staffing" element={<StaffingPage />} />
             <Route path="leave-ledger" element={<LeaveLedgerPage />} />
+            {/* 考勤汇总台账暂缓：页面文件缺失会导致整站白屏 */}
+            <Route path="attendance-summary" element={<Navigate to="/" replace />} />
+            <Route path="attendance" element={<Navigate to="/" replace />} />
             <Route path="admin" element={<AdminPage />} />
           </Route>
         </Routes>

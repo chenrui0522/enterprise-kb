@@ -66,11 +66,13 @@ async def load_principal(db: AsyncSession, user_id: str) -> Principal | None:
         ).scalars().all()
         permissions.update(perm_rows)
 
-    staffing_org_ok, leave_ledger_org_ok = await compute_feature_org_flags(
-        db,
-        tenant_id=user.tenant_id,
-        org_unit_ids=org_unit_ids,
-        permissions=permissions,
+    staffing_org_ok, leave_ledger_org_ok, attendance_summary_org_ok = (
+        await compute_feature_org_flags(
+            db,
+            tenant_id=user.tenant_id,
+            org_unit_ids=org_unit_ids,
+            permissions=permissions,
+        )
     )
 
     return Principal(
@@ -88,4 +90,5 @@ async def load_principal(db: AsyncSession, user_id: str) -> Principal | None:
         establishment_org_unit_ids=tuple(sorted(establishment_ids)),
         staffing_org_ok=staffing_org_ok,
         leave_ledger_org_ok=leave_ledger_org_ok,
+        attendance_summary_org_ok=attendance_summary_org_ok,
     )

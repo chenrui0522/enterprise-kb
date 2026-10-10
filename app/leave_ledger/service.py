@@ -16,6 +16,10 @@ from app.ingestion.storage import FileDocumentStorage
 from app.leave_ledger.classify import classify_source
 from app.leave_ledger.config_data import hq_address_keywords, load_holidays
 from app.leave_ledger.export import build_ledger_xlsx
+from app.leave_ledger.import_export import (
+    ORIGIN_EXPORT_IMPORT,
+    parse_official_export_xlsx,
+)
 from app.leave_ledger.merge import (
     filter_warnings_covered_by_prior,
     merge_ledger_rows,
@@ -231,16 +235,28 @@ async def _recompute(
     return job
 
 
+def prior_source_of_job(job: LeaveLedgerJob) -> str:
+    """Label for merge prior picker: confirmed | export_import."""
+    origin = (job.compute_result or {}).get("origin")
+    if origin == ORIGIN_EXPORT_IMPORT:
+        return "export_import"
+    return "confirmed"
+
+
+def is_prior_eligible(job: LeaveLedgerJob) -> bool:
+    return job.status == "confirmed"
+
+
 async def _apply_merge_onto_job(
     session: AsyncSession,
     job: LeaveLedgerJob,
     *,
     prior_job_id: str,
 ) -> str:
-    """Merge prior confirmed snapshot into job.compute_result. Returns prior id."""
+    """Merge prior confirmed/import snapshot into job.compute_result. Returns prior id."""
     prior = await get_job(session, job.tenant_id, prior_job_id)
-    if prior.status != "confirmed":
-        raise AppError("上月任务必须为已确认状态", status_code=400)
+    if not is_prior_eligible(prior):
+        raise AppError("prior 任务必须为已确认或导入的正式台账", status_code=400)
 
     snap = await session.scalar(
         select(LeaveLedgerSnapshot).where(LeaveLedgerSnapshot.job_id == prior.id)
@@ -249,7 +265,7 @@ async def _apply_merge_onto_job(
         "rows"
     ) or []
     if not prior_rows:
-        raise AppError("上月已确认任务没有可用快照行", status_code=400)
+        raise AppError("prior 任务没有可用快照行", status_code=400)
 
     settings = get_settings()
     current_rows = list((job.compute_result or {}).get("rows") or [])
@@ -257,6 +273,7 @@ async def _apply_merge_onto_job(
         prior_rows,
         current_rows,
         merge_gap_days=settings.leave_ledger_travel_merge_gap_days,
+        holidays=load_holidays(settings) or set(),
     )
 
     payload = dict(job.compute_result or {})
@@ -534,6 +551,7 @@ async def list_confirmed_jobs(
     *,
     tenant_id: str,
 ) -> list[LeaveLedgerJob]:
+    """Prior-eligible jobs: system-confirmed and export-import priors."""
     stmt = (
         select(LeaveLedgerJob)
         .where(
@@ -545,6 +563,74 @@ async def list_confirmed_jobs(
     return list((await session.execute(stmt)).scalars().all())
 
 
+async def import_prior_from_export(
+    session: AsyncSession,
+    *,
+    principal: Principal,
+    filename: str,
+    data: bytes,
+) -> LeaveLedgerJob:
+    """Register official export xlsx as a confirmed prior-eligible job (no merge)."""
+    rows = parse_official_export_xlsx(data)
+    totals = {
+        "person_count": len(rows),
+        "total_comp_days": sum(float(r.get("total_comp_days") or 0) for r in rows),
+        "used_comp_days": sum(float(r.get("used_comp_days") or 0) for r in rows),
+        "remaining_comp_days": sum(
+            float(r.get("remaining_comp_days") or 0) for r in rows
+        ),
+    }
+    job = LeaveLedgerJob(
+        id=new_id(),
+        tenant_id=principal.tenant_id,
+        status="confirmed",
+        created_by=principal.user_id,
+        warnings=[],
+        resolved_warnings={},
+        compute_result={
+            "rows": rows,
+            "totals": totals,
+            "origin": ORIGIN_EXPORT_IMPORT,
+            "import_filename": filename or "export.xlsx",
+        },
+        confirmed_at=_utcnow(),
+        confirmed_by=principal.user_id,
+    )
+    session.add(job)
+    await session.flush()
+    session.add(
+        LeaveLedgerSnapshot(
+            tenant_id=principal.tenant_id,
+            job_id=job.id,
+            rows=rows,
+            source_roles=[],
+            notes="export_import",
+        )
+    )
+    await _add_audit(
+        session,
+        tenant_id=principal.tenant_id,
+        actor=_actor(principal),
+        action="leave_ledger.job.import_prior",
+        resource_id=job.id,
+        detail={
+            "filename": preview_text(filename or "", limit=80),
+            "person_count": len(rows),
+            "origin": ORIGIN_EXPORT_IMPORT,
+        },
+    )
+    log_event(
+        logger,
+        "leave_ledger.import_prior",
+        job_id=job.id,
+        rows=len(rows),
+        filename=preview_text(filename or "", limit=80),
+    )
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
 async def merge_job(
     session: AsyncSession,
     *,
@@ -553,7 +639,7 @@ async def merge_job(
     prior_job_id: str,
 ) -> LeaveLedgerJob:
     if not prior_job_id:
-        raise AppError("请选择已确认的上月台账任务", status_code=400)
+        raise AppError("请选择上月/以往 prior 台账任务", status_code=400)
     if prior_job_id == job_id:
         raise AppError("不能与自身合并", status_code=400)
 

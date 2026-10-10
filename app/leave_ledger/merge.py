@@ -150,6 +150,39 @@ def _merge_ot(
     return [by_date[k] for k in sorted(by_date.keys())]
 
 
+def _filter_ot_for_merged_travel(
+    ot_days: list[dict[str, Any]],
+    travel_segments: list[dict[str, Any]],
+    holidays: set[date] | None,
+) -> list[dict[str, Any]]:
+    """Re-apply Rule 2 after travel union: in-travel OT only on statutory body days.
+
+    Prior jobs often credit weekend OT under Rule 3 (outside travel). After merge
+    expands actual travel over those dates, non-holiday days must be dropped.
+    """
+    holidays = holidays or set()
+    segments: list[tuple[date, date]] = []
+    for seg in travel_segments:
+        start = _parse_date(seg.get("actual_start"))
+        end = _parse_date(seg.get("actual_end"))
+        if start and end:
+            segments.append((start, end))
+
+    out: list[dict[str, Any]] = []
+    for raw in ot_days:
+        day = _parse_date(raw.get("date"))
+        if not day:
+            continue
+        in_travel = any(start <= day <= end for start, end in segments)
+        is_hol = day in holidays
+        row = dict(raw)
+        row["holiday"] = is_hol
+        if in_travel and not is_hol:
+            continue
+        out.append(row)
+    return out
+
+
 def _merge_leave(
     prior: list[dict[str, Any]], current: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -181,6 +214,7 @@ def merge_person_rows(
     current: dict[str, Any] | None,
     *,
     merge_gap_days: int = 1,
+    holidays: set[date] | None = None,
 ) -> dict[str, Any]:
     prior_s = synthesize_segments(prior) if prior else None
     current_s = synthesize_segments(current) if current else None
@@ -205,9 +239,13 @@ def merge_person_rows(
         travel_in, merge_gap_days=merge_gap_days
     )
 
-    ot_days = _merge_ot(
-        list((prior_s or {}).get("ot_days") or []),
-        list((current_s or {}).get("ot_days") or []),
+    ot_days = _filter_ot_for_merged_travel(
+        _merge_ot(
+            list((prior_s or {}).get("ot_days") or []),
+            list((current_s or {}).get("ot_days") or []),
+        ),
+        travel_segments,
+        holidays,
     )
     leave_segments = _merge_leave(
         list((prior_s or {}).get("leave_segments") or []),
@@ -253,6 +291,7 @@ def merge_ledger_rows(
     current_rows: list[dict[str, Any]],
     *,
     merge_gap_days: int = 1,
+    holidays: set[date] | None = None,
 ) -> list[dict[str, Any]]:
     prior_by = {r.get("person_name"): r for r in prior_rows if r.get("person_name")}
     current_by = {r.get("person_name"): r for r in current_rows if r.get("person_name")}
@@ -262,6 +301,7 @@ def merge_ledger_rows(
             prior_by.get(name),
             current_by.get(name),
             merge_gap_days=merge_gap_days,
+            holidays=holidays,
         )
         for name in names
     ]

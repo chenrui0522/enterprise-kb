@@ -6,7 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db_session
 from app.core.errors import AppError
 from app.identity.constants import SESSION_COOKIE_NAME
-from app.identity.feature_gates import can_use_leave_ledger, can_use_staffing
+from app.identity.feature_gates import (
+    can_use_attendance_summary,
+    can_use_leave_ledger,
+    can_use_staffing,
+)
 from app.identity.loader import load_principal
 from app.identity.principal import Principal
 from app.identity.sessions import get_session_by_token
@@ -117,6 +121,29 @@ def require_leave_ledger(*, write: bool = False):
         if not ok:
             raise AppError(
                 "缺少调休台账权限或不在运营管理中心组织范围", status_code=403
+            )
+        return principal
+
+    _permission_deps[key] = _dep
+    return _dep
+
+
+def require_attendance_summary(*, write: bool = False):
+    """Permission + ops subtree (or admin bypass)."""
+    key = f"attendance_summary:{'write' if write else 'read'}"
+    cached = _permission_deps.get(key)
+    if cached is not None:
+        return cached
+
+    async def _dep(principal: Principal = Depends(get_current_principal)) -> Principal:
+        ok = (
+            can_use_attendance_summary(principal, write=True)
+            if write
+            else can_use_attendance_summary(principal, write=None)
+        )
+        if not ok:
+            raise AppError(
+                "缺少考勤汇总台账权限或不在运营管理中心组织范围", status_code=403
             )
         return principal
 

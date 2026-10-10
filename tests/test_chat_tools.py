@@ -11,6 +11,7 @@ from app.chat.tools.registry import (
     list_tools_for_principal,
 )
 from app.chat.tools.router import (
+    sticky_leave_tool_if_job,
     route_turn,
     score_leave_ledger_match,
     score_staffing_match,
@@ -178,3 +179,31 @@ def test_route_staffing_leave_conflict_and_stronger_wins() -> None:
         filename="项目日报.xlsx",
     )
     assert explicit.kind == "leave_ledger" and explicit.reason == "explicit"
+
+
+def test_sticky_leave_tool_if_job() -> None:
+    p = _principal(PERM_LEAVE_LEDGER_READ)
+    assert (
+        sticky_leave_tool_if_job(
+            p,
+            tool_state={"leave_ledger": {"job_id": "abc"}},
+            active_tool=None,
+        )
+        == TOOL_LEAVE_LEDGER
+    )
+    assert (
+        sticky_leave_tool_if_job(
+            p, tool_state={"leave_ledger": {"job_id": "abc"}}, active_tool=TOOL_STAFFING
+        )
+        == TOOL_STAFFING
+    )
+    assert sticky_leave_tool_if_job(p, tool_state={}, active_tool=None) is None
+    no_perm = _principal(PERM_CHAT_USE)
+    assert (
+        sticky_leave_tool_if_job(
+            no_perm,
+            tool_state={"leave_ledger": {"job_id": "abc"}},
+            active_tool=None,
+        )
+        is None
+    )

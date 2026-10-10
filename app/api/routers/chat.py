@@ -33,13 +33,21 @@ from app.chat.title import (
     maybe_enqueue_title_polish,
 )
 from app.chat.tools.attachments import load_attachment, save_chat_xlsx
+from app.chat.tools.attendance_summary_orchestrator import (
+    apply_attendance_summary_action,
+    handle_attendance_summary_message,
+    update_attendance_summary_state,
+)
 from app.chat.tools.leave_ledger_orchestrator import (
     apply_leave_ledger_action,
     handle_leave_ledger_message,
     update_leave_ledger_state,
 )
 from app.chat.tools.registry import (
+    ATTENDANCE_WEAK_CLARIFY_COPY,
+    LEDGER_CLARIFY_COPY,
     LEAVE_WEAK_CLARIFY_COPY,
+    TOOL_ATTENDANCE_SUMMARY,
     TOOL_CONFLICT_CLARIFY_COPY,
     TOOL_LEAVE_LEDGER,
     TOOL_STAFFING,
@@ -47,9 +55,12 @@ from app.chat.tools.registry import (
     list_tools_for_principal,
 )
 from app.chat.tools.router import (
+    resolve_sticky_active_tool,
     route_turn,
+    user_affirms_attendance,
     user_affirms_leave,
     user_affirms_staffing,
+    user_declines_attendance,
     user_declines_leave,
     user_declines_staffing,
 )
@@ -370,6 +381,18 @@ async def chat_tool_action_endpoint(
             payload=body.payload,
         )
         tool_meta = TOOL_LEAVE_LEDGER
+    elif (
+        action.startswith("attendance_summary.")
+        or active_tool == TOOL_ATTENDANCE_SUMMARY
+    ):
+        result = await apply_attendance_summary_action(
+            session,
+            principal=principal,
+            conversation=conversation,
+            action=action,
+            payload=body.payload,
+        )
+        tool_meta = TOOL_ATTENDANCE_SUMMARY
     else:
         result = await apply_staffing_action(
             session,
@@ -522,11 +545,13 @@ async def _chat_event_stream_inner(
         # Phase 1: short-lived session for conversation + user message (+ tool route).
         async with session_factory() as session:
             attachment = None
+            attachments: list[dict] = []
             filename = None
-            if payload.attachment_id:
-                attachment = load_attachment(
-                    payload.attachment_id, user_id=principal.user_id
-                )
+            for aid in payload.effective_attachment_ids():
+                loaded = load_attachment(aid, user_id=principal.user_id)
+                attachments.append(loaded)
+            if attachments:
+                attachment = attachments[0]
                 filename = attachment["filename"]
 
             polish_title: str | None = None
@@ -578,6 +603,10 @@ async def _chat_event_stream_inner(
             # Explicit tool selection updates conversation state; "" clears sticky tool.
             if payload.active_tool == TOOL_LEAVE_LEDGER:
                 update_leave_ledger_state(conversation, active_tool=TOOL_LEAVE_LEDGER)
+            elif payload.active_tool == TOOL_ATTENDANCE_SUMMARY:
+                update_attendance_summary_state(
+                    conversation, active_tool=TOOL_ATTENDANCE_SUMMARY
+                )
             elif payload.active_tool:
                 update_staffing_state(conversation, active_tool=payload.active_tool)
             elif payload.active_tool == "":
@@ -596,9 +625,17 @@ async def _chat_event_stream_inner(
             else:
                 active_tool = active_from_state
 
+            # Composer may clear sticky selection while a ledger job is still bound.
+            active_tool, dual_sticky = resolve_sticky_active_tool(
+                principal, tool_state=state, active_tool=active_tool
+            )
+
             decision = None
             decision_kind = None
             auto_note = None
+            if dual_sticky and not pending_clarify and not active_tool:
+                decision_kind = "ledger_clarify"
+                auto_note = None
             if pending_clarify:
                 if user_affirms_staffing(payload.message) and pending_clarify_for in (
                     None,
@@ -614,6 +651,8 @@ async def _chat_event_stream_inner(
                 elif user_affirms_leave(payload.message) and pending_clarify_for in (
                     TOOL_LEAVE_LEDGER,
                     "conflict",
+                    "ledger",
+                    "dual",
                 ):
                     decision_kind = "leave_ledger"
                     auto_note = "已确认使用调休台账。"
@@ -623,8 +662,24 @@ async def _chat_event_stream_inner(
                     update_leave_ledger_state(
                         conversation, active_tool=TOOL_LEAVE_LEDGER
                     )
-                elif user_declines_staffing(payload.message) or user_declines_leave(
-                    payload.message
+                elif user_affirms_attendance(payload.message) and pending_clarify_for in (
+                    TOOL_ATTENDANCE_SUMMARY,
+                    "conflict",
+                    "ledger",
+                    "dual",
+                ):
+                    decision_kind = "attendance_summary"
+                    auto_note = "已确认使用考勤汇总台账。"
+                    state.pop("pending_clarify", None)
+                    state.pop("pending_clarify_for", None)
+                    set_tool_state(conversation, state)
+                    update_attendance_summary_state(
+                        conversation, active_tool=TOOL_ATTENDANCE_SUMMARY
+                    )
+                elif (
+                    user_declines_staffing(payload.message)
+                    or user_declines_leave(payload.message)
+                    or user_declines_attendance(payload.message)
                 ):
                     decision_kind = "none"
                     auto_note = None
@@ -645,6 +700,8 @@ async def _chat_event_stream_inner(
                         auto_note = "已按人员投入处理。"
                     elif decision.kind == "leave_ledger":
                         auto_note = "已按调休台账处理。"
+                    elif decision.kind == "attendance_summary":
+                        auto_note = "已按考勤汇总台账处理。"
 
             settings = get_settings()
             ctx = await build_chat_context(
@@ -658,8 +715,19 @@ async def _chat_event_stream_inner(
             )
             await session.commit()
 
-            if decision_kind in ("clarify", "conflict_clarify"):
-                if decision_kind == "conflict_clarify":
+            if decision_kind in ("clarify", "conflict_clarify", "ledger_clarify"):
+                if decision_kind == "ledger_clarify" or dual_sticky:
+                    content = (
+                        LEDGER_CLARIFY_COPY
+                        if not dual_sticky
+                        else (
+                            "当前会话同时绑定了调休台账与考勤汇总任务。"
+                            "请回复「调休台账」或「考勤汇总台账」以继续。"
+                        )
+                    )
+                    clarify_for = "dual" if dual_sticky else "ledger"
+                    clarify_tool = None
+                elif decision_kind == "conflict_clarify":
                     content = TOOL_CONFLICT_CLARIFY_COPY
                     clarify_for = "conflict"
                     clarify_tool = None
@@ -667,6 +735,10 @@ async def _chat_event_stream_inner(
                     content = LEAVE_WEAK_CLARIFY_COPY
                     clarify_for = TOOL_LEAVE_LEDGER
                     clarify_tool = TOOL_LEAVE_LEDGER
+                elif decision and decision.tool_id == TOOL_ATTENDANCE_SUMMARY:
+                    content = ATTENDANCE_WEAK_CLARIFY_COPY
+                    clarify_for = TOOL_ATTENDANCE_SUMMARY
+                    clarify_tool = TOOL_ATTENDANCE_SUMMARY
                 else:
                     content = WEAK_CLARIFY_COPY
                     clarify_for = TOOL_STAFFING
@@ -715,6 +787,11 @@ async def _chat_event_stream_inner(
                     content = exc.message
                     result = {"content": content, "card": None}
                 content = result["content"]
+                if len(attachments) > 1:
+                    content = (
+                        f"{content}\n"
+                        f"（本轮附带 {len(attachments)} 个文件；人员投入仅处理第一份「{filename}」。）"
+                    )
                 card = result.get("card")
                 meta = {"tool": "staffing", "card": card} if card else {"tool": "staffing"}
                 assistant_message = await save_assistant_turn(
@@ -756,7 +833,7 @@ async def _chat_event_stream_inner(
                         principal=principal,
                         conversation=conversation,
                         message=payload.message,
-                        attachment=attachment,
+                        attachments=attachments or None,
                         auto_note=auto_note,
                     )
                 except AppError as exc:
@@ -797,6 +874,58 @@ async def _chat_event_stream_inner(
                     logger,
                     "chat leave_ledger done",
                     event="chat.tool.leave_ledger",
+                    ok=True,
+                )
+                return
+
+            if decision_kind == "attendance_summary":
+                try:
+                    result = await handle_attendance_summary_message(
+                        session,
+                        principal=principal,
+                        conversation=conversation,
+                        message=payload.message,
+                        attachments=attachments or None,
+                        auto_note=auto_note,
+                    )
+                except AppError as exc:
+                    content = exc.message
+                    result = {"content": content, "card": None}
+                content = result["content"]
+                card = result.get("card")
+                meta = (
+                    {"tool": TOOL_ATTENDANCE_SUMMARY, "card": card}
+                    if card
+                    else {"tool": TOOL_ATTENDANCE_SUMMARY}
+                )
+                assistant_message = await save_assistant_turn(
+                    session,
+                    conversation_id,
+                    tenant_id,
+                    content,
+                    rewritten_query=None,
+                    citations=[],
+                    meta=meta,
+                )
+                await session.commit()
+                yield sse_event({"event": "token", "data": content})
+                yield sse_event(
+                    {
+                        "event": "done",
+                        "data": {
+                            "conversation_id": conversation_id,
+                            "message_id": assistant_message.id,
+                            "answer": content,
+                            "citations": [],
+                            "card": card,
+                            "error": None,
+                        },
+                    }
+                )
+                log_event(
+                    logger,
+                    "chat attendance_summary done",
+                    event="chat.tool.attendance_summary",
                     ok=True,
                 )
                 return

@@ -15,6 +15,7 @@ from app.identity.principal import Principal
 from app.ingestion.storage import FileDocumentStorage
 from app.leave_ledger import service as leave_service
 from app.schemas.leave_ledger import (
+    LeaveLedgerImportPriorOut,
     LeaveLedgerJobOut,
     LeaveLedgerJobSummaryOut,
     LeaveLedgerMergeIn,
@@ -58,9 +59,40 @@ async def list_leave_ledger_jobs(
                 confirmed_at=job.confirmed_at,
                 created_at=job.created_at,
                 person_count=len(rows),
+                prior_source=leave_service.prior_source_of_job(job),
             )
         )
     return out
+
+
+@router.post(
+    "/leave-ledger/jobs/import-prior",
+    response_model=LeaveLedgerImportPriorOut,
+    status_code=201,
+)
+async def import_leave_ledger_prior(
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_db_session),
+    principal: Principal = Depends(require_leave_ledger(write=True)),
+) -> LeaveLedgerImportPriorOut:
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise AppError("文件过大", status_code=413)
+    job = await leave_service.import_prior_from_export(
+        session,
+        principal=principal,
+        filename=file.filename or "export.xlsx",
+        data=data,
+    )
+    rows = (job.compute_result or {}).get("rows") or []
+    return LeaveLedgerImportPriorOut(
+        id=job.id,
+        status=job.status,
+        person_count=len(rows),
+        prior_source=leave_service.prior_source_of_job(job),
+        confirmed_at=job.confirmed_at,
+        created_at=job.created_at,
+    )
 
 
 @router.post("/leave-ledger/jobs", response_model=LeaveLedgerJobOut, status_code=201)

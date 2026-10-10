@@ -27,6 +27,8 @@ PERM_STAFFING_READ = "staffing:read"
 PERM_STAFFING_WRITE = "staffing:write"
 PERM_LEAVE_LEDGER_READ = "leave_ledger:read"
 PERM_LEAVE_LEDGER_WRITE = "leave_ledger:write"
+PERM_ATTENDANCE_SUMMARY_READ = "attendance_summary:read"
+PERM_ATTENDANCE_SUMMARY_WRITE = "attendance_summary:write"
 
 ALL_PERMISSIONS: tuple[str, ...] = (
     PERM_DOCUMENTS_READ,
@@ -40,6 +42,8 @@ ALL_PERMISSIONS: tuple[str, ...] = (
     PERM_STAFFING_WRITE,
     PERM_LEAVE_LEDGER_READ,
     PERM_LEAVE_LEDGER_WRITE,
+    PERM_ATTENDANCE_SUMMARY_READ,
+    PERM_ATTENDANCE_SUMMARY_WRITE,
 )
 
 ROLE_PERMISSIONS: dict[str, tuple[str, ...]] = {
@@ -52,12 +56,15 @@ ROLE_PERMISSIONS: dict[str, tuple[str, ...]] = {
         PERM_STAFFING_WRITE,
         PERM_LEAVE_LEDGER_READ,
         PERM_LEAVE_LEDGER_WRITE,
+        PERM_ATTENDANCE_SUMMARY_READ,
+        PERM_ATTENDANCE_SUMMARY_WRITE,
     ),
     "reader": (
         PERM_DOCUMENTS_READ,
         PERM_CHAT_USE,
         PERM_STAFFING_READ,
         PERM_LEAVE_LEDGER_READ,
+        PERM_ATTENDANCE_SUMMARY_READ,
     ),
     "auditor": (PERM_DOCUMENTS_READ, PERM_AUDIT_READ),
 }

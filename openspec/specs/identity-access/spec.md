@@ -226,6 +226,7 @@
 本期部门专属映射：
 - 人员投入（`staffing:*`）：允许组织子树根为 `project_mgmt`（项目管理部及其下属项目一/二部）。
 - 调休台账（`leave_ledger:*`）：允许组织子树根为 `ops`（运营管理中心及其下属各部门）。
+- 考勤汇总台账（`attendance_summary:*`）：允许组织子树根为 `ops`（运营管理中心及其下属各部门）。
 
 #### Scenario: 有权但错部门被拒
 - **WHEN** 用户具备 `staffing:write` 但其岗位/编制组织均不在 `project_mgmt` 子树内，且不具备 `users:manage`
@@ -239,6 +240,18 @@
 - **WHEN** 用户具备 `leave_ledger:write` 且岗位挂在 `ops_hr`（人力资源管理部）
 - **THEN** 系统允许其调休台账写操作
 
+#### Scenario: 考勤汇总台账运营中心可过闸
+- **WHEN** 用户具备 `attendance_summary:write` 且岗位挂在 `ops_hr`（人力资源管理部）
+- **THEN** 系统允许其考勤汇总台账写操作
+
+#### Scenario: 考勤汇总台账错部门被拒
+- **WHEN** 用户具备 `attendance_summary:write` 但其组织不在 `ops` 子树，且不具备 `users:manage`
+- **THEN** 系统拒绝考勤汇总台账写操作并返回 403
+
 #### Scenario: 管理员绕过组织闸
 - **WHEN** 用户具备 `users:manage` 与 `leave_ledger:write`，但其组织不在 `ops` 子树
 - **THEN** 系统仍允许其调休台账写操作
+
+#### Scenario: 管理员绕过考勤汇总组织闸
+- **WHEN** 用户具备 `users:manage` 与 `attendance_summary:write`，但其组织不在 `ops` 子树
+- **THEN** 系统仍允许其考勤汇总台账写操作

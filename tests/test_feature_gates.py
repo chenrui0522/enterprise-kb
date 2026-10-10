@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from app.identity.constants import (
+    PERM_ATTENDANCE_SUMMARY_READ,
+    PERM_ATTENDANCE_SUMMARY_WRITE,
     PERM_LEAVE_LEDGER_READ,
     PERM_LEAVE_LEDGER_WRITE,
     PERM_STAFFING_READ,
@@ -12,6 +14,7 @@ from app.identity.constants import (
     PERM_USERS_MANAGE,
 )
 from app.identity.feature_gates import (
+    can_use_attendance_summary,
     can_use_leave_ledger,
     can_use_staffing,
     descendant_org_codes,
@@ -37,7 +40,13 @@ def test_descendant_codes_ops_center() -> None:
     assert "project_mgmt" not in codes
 
 
-def _p(*, perms: tuple[str, ...] = (), staffing_ok: bool = False, leave_ok: bool = False) -> Principal:
+def _p(
+    *,
+    perms: tuple[str, ...] = (),
+    staffing_ok: bool = False,
+    leave_ok: bool = False,
+    attendance_ok: bool = False,
+) -> Principal:
     return Principal(
         user_id="u1",
         tenant_id="autley",
@@ -48,6 +57,7 @@ def _p(*, perms: tuple[str, ...] = (), staffing_ok: bool = False, leave_ok: bool
         permissions=perms,
         staffing_org_ok=staffing_ok,
         leave_ledger_org_ok=leave_ok,
+        attendance_summary_org_ok=attendance_ok,
     )
 
 
@@ -72,6 +82,21 @@ def test_leave_requires_org_and_perm() -> None:
     )
     assert can_use_leave_ledger(
         _p(perms=(PERM_LEAVE_LEDGER_WRITE,), leave_ok=True), write=True
+    )
+
+
+def test_attendance_requires_org_and_perm() -> None:
+    assert not can_use_attendance_summary(
+        _p(perms=(PERM_ATTENDANCE_SUMMARY_WRITE,), attendance_ok=False), write=True
+    )
+    assert can_use_attendance_summary(
+        _p(perms=(PERM_ATTENDANCE_SUMMARY_WRITE,), attendance_ok=True), write=True
+    )
+    assert can_use_attendance_summary(
+        _p(perms=(PERM_ATTENDANCE_SUMMARY_READ,), attendance_ok=True), write=None
+    )
+    assert not can_use_attendance_summary(
+        _p(perms=(PERM_ATTENDANCE_SUMMARY_READ,), attendance_ok=True), write=True
     )
 
 

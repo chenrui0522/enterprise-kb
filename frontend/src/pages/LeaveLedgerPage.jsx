@@ -3,6 +3,7 @@ import {
   confirmLeaveLedgerJob,
   createLeaveLedgerJob,
   exportLeaveLedgerXlsx,
+  importLeaveLedgerPrior,
   listConfirmedLeaveLedgerJobs,
   mergeLeaveLedgerJob,
   reviewLeaveLedgerJob,
@@ -163,7 +164,7 @@ export default function LeaveLedgerPage() {
 
   async function onMerge() {
     if (!job || !priorJobId) {
-      setError("请先选择一份已确认的上月台账");
+      setError("请先选择一份 prior 台账（系统已确认或导入导出）");
       return;
     }
     setBusy(true);
@@ -172,6 +173,22 @@ export default function LeaveLedgerPage() {
       const next = await mergeLeaveLedgerJob(job.id, priorJobId);
       setJob(next);
       setResolutions({});
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onImportPriorFile(file) {
+    if (!file) return;
+    setBusy(true);
+    setError("");
+    try {
+      const imported = await importLeaveLedgerPrior(file);
+      const list = await listConfirmedLeaveLedgerJobs();
+      setConfirmedJobs(list);
+      setPriorJobId(imported.id);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -267,7 +284,7 @@ export default function LeaveLedgerPage() {
             {canWrite && job.status !== "confirmed" && job.status !== "voided" ? (
               <div className="merge-prior" style={{ marginBottom: 12 }}>
                 <label>
-                  合并上月已确认台账{" "}
+                  合并上月/以往台账{" "}
                   <select
                     value={priorJobId}
                     disabled={busy}
@@ -278,6 +295,7 @@ export default function LeaveLedgerPage() {
                       .filter((j) => j.id !== job.id)
                       .map((j) => (
                         <option key={j.id} value={j.id}>
+                          {j.prior_source === "export_import" ? "导入·" : "确认·"}
                           {j.id.slice(0, 8)}… · {j.person_count} 人
                           {j.confirmed_at ? ` · ${String(j.confirmed_at).slice(0, 10)}` : ""}
                         </option>
@@ -287,8 +305,24 @@ export default function LeaveLedgerPage() {
                 <button type="button" disabled={busy || !priorJobId} onClick={onMerge}>
                   合并写回本月
                 </button>
+                <div style={{ marginTop: 8 }}>
+                  <label className="muted">
+                    或上传本系统正式导出台账为 prior{" "}
+                    <input
+                      type="file"
+                      accept=".xlsx"
+                      disabled={busy}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        e.target.value = "";
+                        onImportPriorFile(f);
+                      }}
+                    />
+                  </label>
+                </div>
                 <p className="muted" style={{ marginTop: 4 }}>
-                  合并会按出差并集重算额度；同日加班/同段调休以上月已确认为准。合并后仍需确认。
+                  合并会按出差并集重算额度；同日加班/同段调休以 prior 为准。合并后仍需确认。
+                  上传仅登记 prior，需再点「合并写回本月」。
                 </p>
               </div>
             ) : null}

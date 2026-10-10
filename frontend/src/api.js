@@ -97,7 +97,7 @@ export async function uploadDocument(file, { ocr = false, orgUnitId, projectId, 
   });
   if (!response.ok) {
     handleUnauthorized(response.status);
-    throw new Error((await response.json()).detail || "上传失败");
+    throw new Error((await response.json()).detail || "ä¸Šä¼ å¤±è´¥");
   }
   return response.json();
 }
@@ -137,7 +137,7 @@ export async function streamChat({
   });
   if (!response.ok || !response.body) {
     handleUnauthorized(response.status);
-    throw new Error("无法连接对话服务");
+    throw new Error("æ— æ³•è¿žæŽ¥å¯¹è¯æœåŠ¡");
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
@@ -165,7 +165,7 @@ export async function streamChat({
     }
   }
   if (!sawDone) {
-    throw new Error("对话中断，未收到完整回复，请重试");
+    throw new Error("å¯¹è¯ä¸­æ–­ï¼Œæœªæ”¶åˆ°å®Œæ•´å›žå¤ï¼Œè¯·é‡è¯•");
   }
 }
 
@@ -191,7 +191,7 @@ export async function uploadChatAttachment(file) {
       /* ignore */
     }
     if (response.status === 404) {
-      detail = "附件接口不可用（请重启后端后再试）";
+      detail = "é™„ä»¶æŽ¥å£ä¸å¯ç”¨ï¼ˆè¯·é‡å¯åŽç«¯åŽå†è¯•ï¼‰";
     }
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
@@ -237,7 +237,7 @@ export async function createUser(body) {
 
 export async function bindUserPosition(userId, { positionId, clearance }) {
   if (!clearance) {
-    throw new Error("绑岗必须选择密级");
+    throw new Error("ç»‘å²—å¿…é¡»é€‰æ‹©å¯†çº§");
   }
   return jsonFetch(`/users/${userId}/positions`, {
     method: "POST",
@@ -247,7 +247,7 @@ export async function bindUserPosition(userId, { positionId, clearance }) {
 
 export async function unbindUserPosition(userId, positionId, clearance) {
   if (!clearance) {
-    throw new Error("减岗必须选择密级");
+    throw new Error("å‡å²—å¿…é¡»é€‰æ‹©å¯†çº§");
   }
   const params = new URLSearchParams({ clearance });
   return jsonFetch(`/users/${userId}/positions/${positionId}?${params}`, {
@@ -257,7 +257,7 @@ export async function unbindUserPosition(userId, positionId, clearance) {
 
 export async function updateUserClearance(userId, clearance) {
   if (!clearance) {
-    throw new Error("必须选择密级");
+    throw new Error("å¿…é¡»é€‰æ‹©å¯†çº§");
   }
   return jsonFetch(`/users/${userId}/clearance`, {
     method: "PATCH",
@@ -449,6 +449,28 @@ export async function listConfirmedLeaveLedgerJobs() {
   return jsonFetch(`/leave-ledger/jobs?status=confirmed`);
 }
 
+export async function importLeaveLedgerPrior(file) {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${API_BASE}/leave-ledger/jobs/import-prior`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
 export async function mergeLeaveLedgerJob(jobId, priorJobId) {
   return jsonFetch(`/leave-ledger/jobs/${jobId}/merge`, {
     method: "POST",
@@ -501,6 +523,50 @@ export async function exportLeaveLedgerXlsx(jobId) {
     method: "GET",
     credentials: "include",
   });
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return response.blob();
+}
+
+export async function exportAttendanceSummaryXlsx(jobId) {
+  const response = await fetch(
+    `${API_BASE}/attendance-summary/jobs/${jobId}/export.xlsx`,
+    {
+      method: "GET",
+      credentials: "include",
+    }
+  );
+  if (!response.ok) {
+    handleUnauthorized(response.status);
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = body.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return response.blob();
+}
+
+export async function previewAttendanceSummaryXlsx(jobId) {
+  const response = await fetch(
+    `${API_BASE}/attendance-summary/jobs/${jobId}/preview.xlsx`,
+    {
+      method: "GET",
+      credentials: "include",
+    }
+  );
   if (!response.ok) {
     handleUnauthorized(response.status);
     let detail = response.statusText;

@@ -10,6 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.identity.constants import (
+    PERM_ATTENDANCE_SUMMARY_READ,
+    PERM_ATTENDANCE_SUMMARY_WRITE,
     PERM_LEAVE_LEDGER_READ,
     PERM_LEAVE_LEDGER_WRITE,
     PERM_STAFFING_READ,
@@ -22,11 +24,13 @@ from app.models.identity import OrgUnit
 
 FEATURE_STAFFING = "staffing"
 FEATURE_LEAVE_LEDGER = "leave_ledger"
+FEATURE_ATTENDANCE_SUMMARY = "attendance_summary"
 
 # Org unit *codes* (roots); descendants are included.
 FEATURE_ORG_ROOTS: dict[str, frozenset[str]] = {
     FEATURE_STAFFING: frozenset({"project_mgmt"}),
     FEATURE_LEAVE_LEDGER: frozenset({"ops"}),
+    FEATURE_ATTENDANCE_SUMMARY: frozenset({"ops"}),
 }
 
 # WeCom / address-book imports may use numeric codes while seed uses stable
@@ -34,6 +38,7 @@ FEATURE_ORG_ROOTS: dict[str, frozenset[str]] = {
 FEATURE_ORG_ROOT_NAMES: dict[str, frozenset[str]] = {
     FEATURE_STAFFING: frozenset({"项目管理部"}),
     FEATURE_LEAVE_LEDGER: frozenset({"运营管理中心"}),
+    FEATURE_ATTENDANCE_SUMMARY: frozenset({"运营管理中心"}),
 }
 
 
@@ -136,11 +141,14 @@ async def compute_feature_org_flags(
     tenant_id: str,
     org_unit_ids: set[str] | tuple[str, ...],
     permissions: set[str] | tuple[str, ...],
-) -> tuple[bool, bool]:
-    """Return (staffing_org_ok, leave_ledger_org_ok). Admin bypasses org check."""
+) -> tuple[bool, bool, bool]:
+    """Return (staffing_org_ok, leave_ledger_org_ok, attendance_summary_org_ok).
+
+    Admin / users:manage bypasses org check.
+    """
     perms = set(permissions or ())
     if PERM_USERS_MANAGE in perms:
-        return True, True
+        return True, True, True
     org_ids = set(org_unit_ids or ())
     staffing_ids = await resolve_feature_org_ids(
         session, tenant_id=tenant_id, feature=FEATURE_STAFFING
@@ -148,7 +156,14 @@ async def compute_feature_org_flags(
     leave_ids = await resolve_feature_org_ids(
         session, tenant_id=tenant_id, feature=FEATURE_LEAVE_LEDGER
     )
-    return bool(org_ids & staffing_ids), bool(org_ids & leave_ids)
+    attendance_ids = await resolve_feature_org_ids(
+        session, tenant_id=tenant_id, feature=FEATURE_ATTENDANCE_SUMMARY
+    )
+    return (
+        bool(org_ids & staffing_ids),
+        bool(org_ids & leave_ids),
+        bool(org_ids & attendance_ids),
+    )
 
 
 def org_allows_staffing(principal: Principal) -> bool:
@@ -157,6 +172,10 @@ def org_allows_staffing(principal: Principal) -> bool:
 
 def org_allows_leave_ledger(principal: Principal) -> bool:
     return bool(principal.leave_ledger_org_ok)
+
+
+def org_allows_attendance_summary(principal: Principal) -> bool:
+    return bool(principal.attendance_summary_org_ok)
 
 
 def can_use_staffing(principal: Principal, *, write: bool | None = None) -> bool:
@@ -180,3 +199,18 @@ def can_use_leave_ledger(principal: Principal, *, write: bool | None = None) -> 
     if write is False:
         return PERM_LEAVE_LEDGER_READ in perms
     return bool(perms & {PERM_LEAVE_LEDGER_READ, PERM_LEAVE_LEDGER_WRITE})
+
+
+def can_use_attendance_summary(
+    principal: Principal, *, write: bool | None = None
+) -> bool:
+    if not org_allows_attendance_summary(principal):
+        return False
+    perms = set(principal.permissions or ())
+    if write is True:
+        return PERM_ATTENDANCE_SUMMARY_WRITE in perms
+    if write is False:
+        return PERM_ATTENDANCE_SUMMARY_READ in perms
+    return bool(
+        perms & {PERM_ATTENDANCE_SUMMARY_READ, PERM_ATTENDANCE_SUMMARY_WRITE}
+    )

@@ -1,0 +1,210 @@
+{
+  "conflict:non_company_punch:温惠琴:2026-08-02": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:曹海源:2026-08-09": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:冯晓虎:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:冯晓虎:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:刘三平:2026-08-01": {
+    "prefer": "ignore",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:刘三平:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:刘三平:2026-08-29": {
+    "prefer": "ignore",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:刘三平:2026-08-30": {
+    "prefer": "ignore",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:牛国强:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:张锐:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:赵鑫磊:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:赵鑫磊:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:王中奇:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:王中奇:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:郭俊杰:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:郭俊杰:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:郭俊杰:2026-08-30": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:田鹏明:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:田鹏明:2026-08-30": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:宫瑞宏:2026-08-01": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:宫瑞宏:2026-08-02": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:宫瑞宏:2026-08-09": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:宫瑞宏:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:宫瑞宏:2026-08-16": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:宫瑞宏:2026-08-23": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:宫瑞宏:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:宫瑞宏:2026-08-30": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:刘迪:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:崔霞:2026-08-09": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:马艳香:2026-08-09": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:梁银:2026-08-09": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:郭芳芳:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:王大伟:2026-08-01": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:王大伟:2026-08-02": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:王大伟:2026-08-09": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:王大伟:2026-08-23": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:王大伟:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:王大伟:2026-08-30": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:豆子度:2026-08-01": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:豆子度:2026-08-02": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:豆子度:2026-08-09": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:豆子度:2026-08-16": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:张翔宇:2026-08-01": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:张翔宇:2026-08-09": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:张翔宇:2026-08-15": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:张翔宇:2026-08-16": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:张翔宇:2026-08-29": {
+    "prefer": "present",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:靳占鹏:2026-08-01": {
+    "prefer": "ignore",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:靳占鹏:2026-08-02": {
+    "prefer": "ignore",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:靳占鹏:2026-08-09": {
+    "prefer": "ignore",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:靳占鹏:2026-08-29": {
+    "prefer": "ignore",
+    "at": "manual-user-2026-10-10"
+  },
+  "conflict:non_company_punch:靳占鹏:2026-08-30": {
+    "prefer": "ignore",
+    "at": "manual-user-2026-10-10"
+  }
+}

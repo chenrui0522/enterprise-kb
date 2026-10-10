@@ -24,11 +24,24 @@ class ConversationOut(BaseModel):
     updated_at: datetime
 
 
+_MAX_CHAT_ATTACHMENTS = 8
+
+
 class ChatRequest(BaseModel):
     conversation_id: str | None = None
     message: str = Field(min_length=1, max_length=4000)
     active_tool: str | None = Field(default=None, max_length=64)
     attachment_id: str | None = Field(default=None, max_length=32)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=_MAX_CHAT_ATTACHMENTS)
+
+    def effective_attachment_ids(self) -> list[str]:
+        """Prefer ``attachment_ids``; fall back to singular ``attachment_id``."""
+        ids = [str(x).strip() for x in (self.attachment_ids or []) if str(x).strip()]
+        if ids:
+            return ids[:_MAX_CHAT_ATTACHMENTS]
+        if self.attachment_id:
+            return [self.attachment_id]
+        return []
 
 
 class ChatToolOut(BaseModel):
